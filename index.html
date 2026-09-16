@@ -1,0 +1,2127 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>Log Panggilan AM</title>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="https://unpkg.com/chart.js@4.4.4/dist/chart.umd.js"></script>
+<style>
+  html, body { margin: 0; padding: 0; background: #EEF1EE; }
+  #root { padding: 20px; }
+</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel">
+const { useState, useEffect, useRef } = React;
+
+// ---- Firebase Firestore-backed storage (shared, online, semua laptop sync) ----
+// (mirrors the same get/set/list shape as before, jadi semua logic di bawah gak perlu diubah)
+const firebaseConfig = {
+  apiKey: "AIzaSyCfiG8Ysic2am6BTtcFo77VgqYxkuUmrVM",
+  authDomain: "am-performance-tracker.firebaseapp.com",
+  projectId: "am-performance-tracker",
+  storageBucket: "am-performance-tracker.firebasestorage.app",
+  messagingSenderId: "777416688081",
+  appId: "1:777416688081:web:daacb6c0850b1daa9ca0f0",
+  measurementId: "G-WGN2ME6PN9",
+};
+firebase.initializeApp(firebaseConfig);
+const db = firebase.firestore();
+const KV = db.collection("kv");
+
+// Firestore doc ID gak boleh mengandung "/", key kita (mis. "day:2026-09-15") aman karena
+// cuma pakai ":" dan "-". Kalau suatu saat ada key aneh yang mengandung "/", di-encode dulu.
+function docIdFor(key) {
+  return key.replace(/\//g, "__slash__");
+}
+
+window.storage = {
+  get: async (key) => {
+    const snap = await KV.doc(docIdFor(key)).get();
+    if (!snap.exists) throw new Error("not found");
+    const data = snap.data();
+    return { key, value: data.value };
+  },
+  set: async (key, value) => {
+    await KV.doc(docIdFor(key)).set({ key, value });
+    return { key, value };
+  },
+  delete: async (key) => {
+    await KV.doc(docIdFor(key)).delete();
+    return { key, deleted: true };
+  },
+  list: async (prefix) => {
+    let q = KV;
+    if (prefix) {
+      q = q.where("key", ">=", prefix).where("key", "<", prefix + "\uf8ff");
+    }
+    const snap = await q.get();
+    const keys = [];
+    snap.forEach((doc) => keys.push(doc.data().key));
+    return { keys };
+  },
+};
+
+const DEFAULT_AM_LIST = [
+  "Alda Fadel",
+  "Alfandy",
+  "Aulia Mirza",
+  "Bintang Allysyananda",
+  "Desteri Pramita",
+  "Eko Pujiyanto",
+  "Fauzi Nasrulloh",
+  "Gabriele N.Renata",
+  "Girindra Wardhana",
+  "Jaka Prastyawan",
+  "Jilly Jessica",
+  "Monica",
+  "Muhammad Luthfi",
+  "Mutiah Arrhosidah",
+  "Ningmalasyari Guntar",
+  "Rino Rino",
+  "Robby Riezky",
+  "Sheldy Sheldy",
+  "Siti Annisa",
+  "Vera Junian",
+];
+
+const REMINDER_HOUR = 15; // jam 15:00 — mulai highlight AM yang belum isi data
+
+function pad(n) {
+  return String(n).padStart(2, "0");
+}
+function isoOf(d) {
+  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
+}
+function todayISO() {
+  return isoOf(new Date());
+}
+function nowHM() {
+  const d = new Date();
+  return `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+function shiftDate(iso, days) {
+  const d = new Date(iso + "T00:00:00");
+  d.setDate(d.getDate() + days);
+  return isoOf(d);
+}
+function shiftWorkday(iso, dir) {
+  let d = shiftDate(iso, dir);
+  let day = new Date(d + "T00:00:00").getDay();
+  while (day === 0 || day === 6) {
+    d = shiftDate(d, dir);
+    day = new Date(d + "T00:00:00").getDay();
+  }
+  return d;
+}
+function nearestWorkday(iso) {
+  const day = new Date(iso + "T00:00:00").getDay();
+  if (day === 0) return shiftDate(iso, -2);
+  if (day === 6) return shiftDate(iso, -1);
+  return iso;
+}
+function mondayOf(iso) {
+  const d = new Date(iso + "T00:00:00");
+  const day = d.getDay();
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return isoOf(d);
+}
+function fmtLabel(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("id-ID", { weekday: "long", day: "numeric", month: "long" });
+}
+function fmtShort(iso) {
+  const d = new Date(iso + "T00:00:00");
+  return d.toLocaleDateString("id-ID", { day: "numeric", month: "short" });
+}
+function newId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
+}
+function csvField(v) {
+  const s = String(v ?? "");
+  if (/[",\n]/.test(s)) return '"' + s.replace(/"/g, '""') + '"';
+  return s;
+}
+function toCSV(rows) {
+  return "\uFEFF" + rows.map((r) => r.map(csvField).join(",")).join("\r\n");
+}
+function toTSV(rows) {
+  return rows.map((r) => r.map((v) => String(v ?? "").replace(/\t/g, " ").replace(/\n/g, " ")).join("\t")).join("\n");
+}
+function downloadCSV(filename, text) {
+  const blob = new Blob([text], { type: "text/csv;charset=utf-8;" });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement("a");
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
+}
+function emptyEntry() {
+  return { called: false, sign: 0, ho: 0, followUps: [] };
+}
+function emptyDay(list) {
+  const obj = {};
+  list.forEach((n) => (obj[n] = emptyEntry()));
+  return obj;
+}
+
+// Cari nilai "sign" (kumulatif) terakhir yang tercatat untuk tiap nama AM,
+// pada atau sebelum tanggal tertentu. Dipakai buat auto-carry sign pas ganti hari,
+// dan buat menghitung "sign hari ini" / "sign minggu ini" (selisih dari baseline).
+async function getFieldSnapshot(names, atOrBeforeDate, field) {
+  const remaining = new Set(names);
+  const map = {};
+  try {
+    const listRes = await window.storage.list("day:");
+    const keys = (listRes && listRes.keys) || [];
+    const dates = keys
+      .map((k) => k.slice(4))
+      .filter((d) => d <= atOrBeforeDate)
+      .sort()
+      .reverse();
+    for (const d of dates) {
+      if (remaining.size === 0) break;
+      try {
+        const res = await window.storage.get(`day:${d}`);
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          remaining.forEach((n) => {
+            if (parsed[n] && parsed[n][field] != null) map[n] = Number(parsed[n][field]) || 0;
+          });
+          [...remaining].forEach((n) => {
+            if (map[n] != null) remaining.delete(n);
+          });
+        }
+      } catch (e) {}
+    }
+  } catch (e) {}
+  names.forEach((n) => {
+    if (map[n] == null) map[n] = 0;
+  });
+  return map;
+}
+function getSignSnapshot(names, atOrBeforeDate) {
+  return getFieldSnapshot(names, atOrBeforeDate, "sign");
+}
+function getHoSnapshot(names, atOrBeforeDate) {
+  return getFieldSnapshot(names, atOrBeforeDate, "ho");
+}
+
+function TeamTrendChart({ dates, series, metricLabel }) {
+  const canvasRef = React.useRef(null);
+  const chartRef = React.useRef(null);
+  React.useEffect(() => {
+    if (!canvasRef.current || !window.Chart) return;
+    if (chartRef.current) chartRef.current.destroy();
+    const palette = ["#2F6D4F", "#38508C", "#B4562B", "#8A4FB0", "#B0355C", "#3B8C8C", "#8C7A2F", "#5C5C5C"];
+    chartRef.current = new window.Chart(canvasRef.current, {
+      type: "line",
+      data: {
+        labels: dates.map((d) => fmtShort(d)),
+        datasets: series.map((s, i) => ({
+          label: s.name,
+          data: s.values,
+          borderColor: palette[i % palette.length],
+          backgroundColor: palette[i % palette.length],
+          tension: 0.25,
+          pointRadius: 2,
+          borderWidth: 2,
+        })),
+      },
+      options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        plugins: { legend: { position: "bottom", labels: { boxWidth: 10, font: { size: 11 } } } },
+        scales: {
+          y: { beginAtZero: true, title: { display: true, text: metricLabel } },
+          x: { ticks: { maxRotation: 0, autoSkip: true, maxTicksLimit: 8 } },
+        },
+      },
+    });
+    return () => {
+      if (chartRef.current) chartRef.current.destroy();
+    };
+  }, [dates, series, metricLabel]);
+  return (
+    <div style={{ height: 320 }}>
+      <canvas ref={canvasRef}></canvas>
+    </div>
+  );
+}
+
+function AMCallTracker() {
+  const [amList, setAmList] = useState([]);
+  const [amListLoading, setAmListLoading] = useState(true);
+  const [newAmName, setNewAmName] = useState("");
+
+  const [teams, setTeams] = useState([]);
+  const [teamsLoading, setTeamsLoading] = useState(true);
+  const [newTeamName, setNewTeamName] = useState("");
+  const [newTeamLeader, setNewTeamLeader] = useState("");
+  const [draggingAm, setDraggingAm] = useState(null);
+  const [dragOverCol, setDragOverCol] = useState(null);
+
+  const [activeTeamTab, setActiveTeamTab] = useState(() => {
+    try {
+      return localStorage.getItem("am-tracker-team-tab") || "all";
+    } catch (e) {
+      return "all";
+    }
+  });
+
+  const [teamPerfRange, setTeamPerfRange] = useState("today");
+  const [teamPerfWeekStart, setTeamPerfWeekStart] = useState(mondayOf(todayISO()));
+  const [teamPerfAgg, setTeamPerfAgg] = useState(null);
+  const [teamPerfLoading, setTeamPerfLoading] = useState(false);
+  const [teamPerfExpanded, setTeamPerfExpanded] = useState({});
+
+  const [teamPerfSubview, setTeamPerfSubview] = useState("ranking");
+  const [trendMetric, setTrendMetric] = useState("sign");
+  const [trendDays, setTrendDays] = useState(30);
+  const [trendData, setTrendData] = useState(null);
+  const [trendLoading, setTrendLoading] = useState(false);
+
+  const [backingUpJson, setBackingUpJson] = useState(false);
+  const [backingUpExcel, setBackingUpExcel] = useState(false);
+
+  const [hotLeads, setHotLeads] = useState([]);
+  const [hotLeadsLoading, setHotLeadsLoading] = useState(true);
+
+  const [leadsIn, setLeadsIn] = useState([]);
+  const [leadsInLoading, setLeadsInLoading] = useState(true);
+
+  const [gmeetToday, setGmeetToday] = useState([]);
+  const [gmeetLoading, setGmeetLoading] = useState(true);
+
+  const [date, setDate] = useState(nearestWorkday(todayISO()));
+  const [data, setData] = useState({});
+  const [signBaseline, setSignBaseline] = useState({});
+  const [hoBaseline, setHoBaseline] = useState({});
+  const [loading, setLoading] = useState(true);
+  const [expanded, setExpanded] = useState(null);
+  const [view, setView] = useState("today");
+  const [weekStart, setWeekStart] = useState(mondayOf(todayISO()));
+  const [weekly, setWeekly] = useState(null);
+  const [weeklyLoading, setWeeklyLoading] = useState(false);
+  const [copiedSummary, setCopiedSummary] = useState(false);
+  const [copiedTable, setCopiedTable] = useState(false);
+  const [briefingData, setBriefingData] = useState(null);
+  const [briefingLoading, setBriefingLoading] = useState(false);
+  const [copiedBriefing, setCopiedBriefing] = useState(false);
+  const [exportingLog, setExportingLog] = useState(false);
+  const [lastLogCSVRows, setLastLogCSVRows] = useState(null);
+  const [copiedHotLeadsCSV, setCopiedHotLeadsCSV] = useState(false);
+  const [copiedLogCSV, setCopiedLogCSV] = useState(false);
+  const [copiedLeadsInCSV, setCopiedLeadsInCSV] = useState(false);
+  const [copiedGmeetCSV, setCopiedGmeetCSV] = useState(false);
+  const [uploadMsg, setUploadMsg] = useState("");
+  const [uploading, setUploading] = useState(false);
+  const [, setTick] = useState(0);
+
+  const saveTimer = useRef(null);
+  const skipSave = useRef(true);
+  const hlSaveTimer = useRef(null);
+  const skipHlSave = useRef(true);
+  const liSaveTimer = useRef(null);
+  const skipLiSave = useRef(true);
+  const gmSaveTimer = useRef(null);
+  const skipGmSave = useRef(true);
+  const leadsFileInputRef = useRef(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("am-list");
+        if (cancelled) return;
+        if (res && res.value) {
+          setAmList(JSON.parse(res.value));
+        } else {
+          setAmList(DEFAULT_AM_LIST);
+          await window.storage.set("am-list", JSON.stringify(DEFAULT_AM_LIST));
+        }
+      } catch (e) {
+        if (!cancelled) setAmList(DEFAULT_AM_LIST);
+      } finally {
+        if (!cancelled) setAmListLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("teams");
+        if (cancelled) return;
+        if (res && res.value) {
+          setTeams(JSON.parse(res.value));
+        } else {
+          setTeams([]);
+        }
+      } catch (e) {
+        if (!cancelled) setTeams([]);
+      } finally {
+        if (!cancelled) setTeamsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("hotleads");
+        if (cancelled) return;
+        if (res && res.value) {
+          setHotLeads(JSON.parse(res.value));
+        } else {
+          setHotLeads([]);
+        }
+      } catch (e) {
+        if (!cancelled) setHotLeads([]);
+      } finally {
+        if (!cancelled) setHotLeadsLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (hotLeadsLoading) return;
+    if (skipHlSave.current) {
+      skipHlSave.current = false;
+      return;
+    }
+    if (hlSaveTimer.current) clearTimeout(hlSaveTimer.current);
+    hlSaveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set("hotleads", JSON.stringify(hotLeads));
+      } catch (e) {
+        console.error("gagal menyimpan hot leads", e);
+      }
+    }, 500);
+    return () => clearTimeout(hlSaveTimer.current);
+  }, [hotLeads, hotLeadsLoading]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("leadsin");
+        if (cancelled) return;
+        if (res && res.value) {
+          setLeadsIn(JSON.parse(res.value));
+        } else {
+          setLeadsIn([]);
+        }
+      } catch (e) {
+        if (!cancelled) setLeadsIn([]);
+      } finally {
+        if (!cancelled) setLeadsInLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (leadsInLoading) return;
+    if (skipLiSave.current) {
+      skipLiSave.current = false;
+      return;
+    }
+    if (liSaveTimer.current) clearTimeout(liSaveTimer.current);
+    liSaveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set("leadsin", JSON.stringify(leadsIn));
+      } catch (e) {
+        console.error("gagal menyimpan leads in", e);
+      }
+    }, 500);
+    return () => clearTimeout(liSaveTimer.current);
+  }, [leadsIn, leadsInLoading]);
+
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const res = await window.storage.get("gmeet-today");
+        if (cancelled) return;
+        if (res && res.value) {
+          setGmeetToday(JSON.parse(res.value));
+        } else {
+          setGmeetToday([]);
+        }
+      } catch (e) {
+        if (!cancelled) setGmeetToday([]);
+      } finally {
+        if (!cancelled) setGmeetLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
+
+  useEffect(() => {
+    if (gmeetLoading) return;
+    if (skipGmSave.current) {
+      skipGmSave.current = false;
+      return;
+    }
+    if (gmSaveTimer.current) clearTimeout(gmSaveTimer.current);
+    gmSaveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set("gmeet-today", JSON.stringify(gmeetToday));
+      } catch (e) {
+        console.error("gagal menyimpan gmeet today", e);
+      }
+    }, 500);
+    return () => clearTimeout(gmSaveTimer.current);
+  }, [gmeetToday, gmeetLoading]);
+
+  const saveAmList = async (list) => {
+    try {
+      await window.storage.set("am-list", JSON.stringify(list));
+    } catch (e) {
+      console.error("gagal menyimpan daftar AM", e);
+    }
+  };
+
+  const handleAddAM = () => {
+    const name = newAmName.trim();
+    if (!name) return;
+    if (amList.some((n) => n.toLowerCase() === name.toLowerCase())) {
+      setNewAmName("");
+      return;
+    }
+    const next = [...amList, name];
+    setAmList(next);
+    saveAmList(next);
+    setNewAmName("");
+  };
+
+  const handleRemoveAM = (name) => {
+    const next = amList.filter((n) => n !== name);
+    setAmList(next);
+    saveAmList(next);
+    // AM yang dihapus juga otomatis keluar dari tim manapun dia ada
+    const nextTeams = teams.map((t) => ({ ...t, memberNames: t.memberNames.filter((n) => n !== name) }));
+    setTeams(nextTeams);
+    saveTeams(nextTeams);
+  };
+
+  const saveTeams = async (list) => {
+    try {
+      await window.storage.set("teams", JSON.stringify(list));
+    } catch (e) {
+      console.error("gagal menyimpan tim", e);
+    }
+  };
+
+  const handleAddTeam = () => {
+    const name = newTeamName.trim();
+    if (!name) return;
+    const t = { id: newId(), name, leaderName: newTeamLeader.trim(), memberNames: [] };
+    const next = [...teams, t];
+    setTeams(next);
+    saveTeams(next);
+    setNewTeamName("");
+    setNewTeamLeader("");
+  };
+
+  const handleRenameTeam = (id, name) => {
+    const next = teams.map((t) => (t.id === id ? { ...t, name } : t));
+    setTeams(next);
+    saveTeams(next);
+  };
+
+  const handleSetTeamLeader = (id, leaderName) => {
+    const next = teams.map((t) => (t.id === id ? { ...t, leaderName } : t));
+    setTeams(next);
+    saveTeams(next);
+  };
+
+  const handleRemoveTeam = (id) => {
+    const next = teams.filter((t) => t.id !== id);
+    setTeams(next);
+    saveTeams(next);
+  };
+
+  // teamId "" berarti "Belum dikelompokkan" (AM dikeluarin dari semua tim)
+  const assignAmToTeam = (amName, teamId) => {
+    const next = teams.map((t) => ({
+      ...t,
+      memberNames:
+        teamId === t.id
+          ? t.memberNames.includes(amName)
+            ? t.memberNames
+            : [...t.memberNames, amName]
+          : t.memberNames.filter((n) => n !== amName),
+    }));
+    setTeams(next);
+    saveTeams(next);
+  };
+
+  const teamIdOfAm = (amName) => {
+    const t = teams.find((t) => t.memberNames.includes(amName));
+    return t ? t.id : "";
+  };
+
+  const handleDragStartAm = (name) => (ev) => {
+    setDraggingAm(name);
+    try { ev.dataTransfer.effectAllowed = "move"; ev.dataTransfer.setData("text/plain", name); } catch (e) {}
+  };
+  const handleDragEndAm = () => {
+    setDraggingAm(null);
+    setDragOverCol(null);
+  };
+  const handleDragOverCol = (colId) => (ev) => {
+    ev.preventDefault();
+    if (dragOverCol !== colId) setDragOverCol(colId);
+  };
+  const handleDropCol = (teamId) => (ev) => {
+    ev.preventDefault();
+    if (draggingAm) assignAmToTeam(draggingAm, teamId);
+    setDraggingAm(null);
+    setDragOverCol(null);
+  };
+
+  useEffect(() => {
+    const t = setInterval(() => setTick((x) => x + 1), 60000);
+    return () => clearInterval(t);
+  }, []);
+
+  useEffect(() => {
+    if (amListLoading) return;
+    let cancelled = false;
+    setLoading(true);
+    skipSave.current = true;
+    (async () => {
+      try {
+        const baseline = await getSignSnapshot(amList, shiftDate(date, -1));
+        const hoBase = await getHoSnapshot(amList, shiftDate(date, -1));
+        if (cancelled) return;
+        setSignBaseline(baseline);
+        setHoBaseline(hoBase);
+
+        const res = await window.storage.get(`day:${date}`);
+        if (cancelled) return;
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          const merged = emptyDay(amList);
+          amList.forEach((n) => {
+            if (parsed[n]) {
+              merged[n] = {
+                ...emptyEntry(),
+                called: !!parsed[n].called,
+                sign: parsed[n].sign || 0,
+                ho: parsed[n].ho || 0,
+                followUps: Array.isArray(parsed[n].followUps) ? parsed[n].followUps : [],
+              };
+            } else {
+              // AM belum ada catatan di hari ini — mulai dari sign & HO hari sebelumnya, bukan 0
+              merged[n] = { ...emptyEntry(), sign: baseline[n] || 0, ho: hoBase[n] || 0 };
+            }
+          });
+          setData(merged);
+        } else {
+          // Hari baru, belum pernah diisi sama sekali — semua AM mulai dari sign & HO terakhir mereka
+          const fresh = emptyDay(amList);
+          amList.forEach((n) => {
+            fresh[n] = { ...fresh[n], sign: baseline[n] || 0, ho: hoBase[n] || 0 };
+          });
+          setData(fresh);
+        }
+      } catch (e) {
+        if (!cancelled) setData(emptyDay(amList));
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [date, amList, amListLoading]);
+
+  useEffect(() => {
+    if (loading) return;
+    if (skipSave.current) {
+      skipSave.current = false;
+      return;
+    }
+    if (saveTimer.current) clearTimeout(saveTimer.current);
+    saveTimer.current = setTimeout(async () => {
+      try {
+        await window.storage.set(`day:${date}`, JSON.stringify(data));
+      } catch (e) {
+        console.error("gagal menyimpan", e);
+      }
+    }, 500);
+    return () => clearTimeout(saveTimer.current);
+  }, [data, date, loading]);
+
+  useEffect(() => {
+    if (view !== "weekly" || amListLoading || hotLeadsLoading) return;
+    let cancelled = false;
+    setWeeklyLoading(true);
+    (async () => {
+      const range = Array.from({ length: 5 }, (_, i) => shiftDate(weekStart, i));
+      const agg = {};
+      amList.forEach((n) => (agg[n] = { signs: 0, ho: 0, calledDays: 0, followUps: [] }));
+      for (const iso of range) {
+        try {
+          const res = await window.storage.get(`day:${iso}`);
+          if (res && res.value) {
+            const parsed = JSON.parse(res.value);
+            amList.forEach((n) => {
+              const e = parsed[n];
+              if (!e) return;
+              if (e.called) agg[n].calledDays += 1;
+              (Array.isArray(e.followUps) ? e.followUps : []).forEach((f) => agg[n].followUps.push({ ...f, date: iso }));
+            });
+          }
+        } catch (e) {
+          // gak ada data di tanggal itu — lewati
+        }
+      }
+      // "sign"/"ho" itu angka kumulatif (kebawa tiap hari), jadi angka minggu ini = nilai akhir - nilai sebelum minggu mulai
+      if (!cancelled) {
+        const baseline = await getSignSnapshot(amList, shiftDate(weekStart, -1));
+        const final = await getSignSnapshot(amList, range[range.length - 1]);
+        const hoBaselineWk = await getHoSnapshot(amList, shiftDate(weekStart, -1));
+        const hoFinalWk = await getHoSnapshot(amList, range[range.length - 1]);
+        if (!cancelled) {
+          amList.forEach((n) => {
+            agg[n].signs = Math.max(0, (final[n] || 0) - (baseline[n] || 0));
+            agg[n].ho = Math.max(0, (hoFinalWk[n] || 0) - (hoBaselineWk[n] || 0));
+          });
+        }
+      }
+      if (!cancelled) {
+        setWeekly({ range, byAm: agg });
+        setWeeklyLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [view, weekStart, amList, amListLoading, hotLeadsLoading]);
+
+  useEffect(() => {
+    if (view !== "briefing" || amListLoading) return;
+    let cancelled = false;
+    setBriefingLoading(true);
+    (async () => {
+      try {
+        const res = await window.storage.get(`day:${date}`);
+        if (cancelled) return;
+        if (res && res.value) {
+          const parsed = JSON.parse(res.value);
+          const merged = emptyDay(amList);
+          amList.forEach((n) => {
+            if (parsed[n]) {
+              merged[n] = {
+                ...emptyEntry(),
+                called: !!parsed[n].called,
+                sign: parsed[n].sign || 0,
+                ho: parsed[n].ho || 0,
+                followUps: Array.isArray(parsed[n].followUps) ? parsed[n].followUps : [],
+              };
+            }
+          });
+          setBriefingData(merged);
+        } else {
+          setBriefingData(emptyDay(amList));
+        }
+      } catch (e) {
+        if (!cancelled) setBriefingData(emptyDay(amList));
+      } finally {
+        if (!cancelled) setBriefingLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [view, date, amList, amListLoading]);
+
+  useEffect(() => {
+    if (view !== "teamperf" || amListLoading) return;
+    let cancelled = false;
+    setTeamPerfLoading(true);
+    (async () => {
+      const byAm = {};
+      amList.forEach((n) => (byAm[n] = { sign: 0, ho: 0 }));
+      try {
+        if (teamPerfRange === "today") {
+          const todayIso = todayISO();
+          const [finalSign, finalHo, baseSign, baseHo] = await Promise.all([
+            getSignSnapshot(amList, todayIso),
+            getHoSnapshot(amList, todayIso),
+            getSignSnapshot(amList, shiftDate(todayIso, -1)),
+            getHoSnapshot(amList, shiftDate(todayIso, -1)),
+          ]);
+          amList.forEach((n) => {
+            byAm[n].sign = Math.max(0, (finalSign[n] || 0) - (baseSign[n] || 0));
+            byAm[n].ho = Math.max(0, (finalHo[n] || 0) - (baseHo[n] || 0));
+          });
+        } else if (teamPerfRange === "week") {
+          const range = Array.from({ length: 5 }, (_, i) => shiftDate(teamPerfWeekStart, i));
+          const [finalSign, finalHo, baseSign, baseHo] = await Promise.all([
+            getSignSnapshot(amList, range[range.length - 1]),
+            getHoSnapshot(amList, range[range.length - 1]),
+            getSignSnapshot(amList, shiftDate(teamPerfWeekStart, -1)),
+            getHoSnapshot(amList, shiftDate(teamPerfWeekStart, -1)),
+          ]);
+          amList.forEach((n) => {
+            byAm[n].sign = Math.max(0, (finalSign[n] || 0) - (baseSign[n] || 0));
+            byAm[n].ho = Math.max(0, (finalHo[n] || 0) - (baseHo[n] || 0));
+          });
+        } else {
+          // mtd = angka kumulatif per-AM sampai hari ini (konsisten sama label "MTD" yang udah dipakai di view lain)
+          const [finalSign, finalHo] = await Promise.all([
+            getSignSnapshot(amList, todayISO()),
+            getHoSnapshot(amList, todayISO()),
+          ]);
+          amList.forEach((n) => {
+            byAm[n].sign = finalSign[n] || 0;
+            byAm[n].ho = finalHo[n] || 0;
+          });
+        }
+      } catch (e) {
+        console.error("gagal menghitung performance tim", e);
+      }
+      if (!cancelled) {
+        setTeamPerfAgg({ byAm });
+        setTeamPerfLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [view, teamPerfRange, teamPerfWeekStart, amList, amListLoading]);
+
+  useEffect(() => {
+    if (view !== "teamperf" || teamPerfSubview !== "trend" || amListLoading || teamsLoading) return;
+    let cancelled = false;
+    setTrendLoading(true);
+    (async () => {
+      try {
+        const endDate = todayISO();
+        const startDate = shiftDate(endDate, -(trendDays - 1));
+        const dateRange = Array.from({ length: trendDays }, (_, i) => shiftDate(startDate, i));
+        const dateRangeSet = new Set(dateRange);
+
+        const listRes = await window.storage.list("day:");
+        const keys = (listRes && listRes.keys) || [];
+        const relevantDates = keys.map((k) => k.slice(4)).filter((d) => d <= endDate).sort();
+
+        const perDate = {};
+        for (const d of relevantDates) {
+          try {
+            const res = await window.storage.get(`day:${d}`);
+            if (res && res.value) perDate[d] = JSON.parse(res.value);
+          } catch (e) {}
+        }
+
+        // Gabung semua tanggal histori + tanggal yang mau ditampilin, urut, terus jalan maju sambil
+        // "bawa" nilai terakhir yang diketahui tiap AM (forward-fill) — biar hari yang gak diisi
+        // (weekend, dsb) tetap kepakai angka terakhir, bukan 0.
+        const combinedDates = Array.from(new Set([...relevantDates, ...dateRange])).sort();
+        const lastKnown = {};
+        amList.forEach((n) => (lastKnown[n] = 0));
+        const snapshotAt = {};
+        combinedDates.forEach((d) => {
+          const dayObj = perDate[d];
+          if (dayObj) {
+            amList.forEach((n) => {
+              if (dayObj[n] && dayObj[n][trendMetric] != null) lastKnown[n] = Number(dayObj[n][trendMetric]) || 0;
+            });
+          }
+          if (dateRangeSet.has(d)) snapshotAt[d] = { ...lastKnown };
+        });
+
+        const groups = teams.map((t) => ({ id: t.id, name: t.name, members: t.memberNames.filter((n) => amList.includes(n)) }));
+        const assignedSet = new Set(teams.flatMap((t) => t.memberNames));
+        const unassigned = amList.filter((n) => !assignedSet.has(n));
+        if (unassigned.length) groups.push({ id: "__unassigned", name: "Belum dikelompokkan", members: unassigned });
+
+        const series = groups.map((g) => ({
+          id: g.id,
+          name: g.name,
+          values: dateRange.map((d) => g.members.reduce((sum, n) => sum + ((snapshotAt[d] && snapshotAt[d][n]) || 0), 0)),
+        }));
+
+        if (!cancelled) {
+          setTrendData({ dates: dateRange, series });
+          setTrendLoading(false);
+        }
+      } catch (e) {
+        console.error("gagal menghitung tren", e);
+        if (!cancelled) setTrendLoading(false);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, [view, teamPerfSubview, trendMetric, trendDays, amList, amListLoading, teams, teamsLoading]);
+
+  const setEntry = (name, patch) =>
+    setData((prev) => ({ ...prev, [name]: { ...(prev[name] || emptyEntry()), ...patch } }));
+
+  const toggleCalled = (name) => {
+    setData((prev) => {
+      const cur = prev[name] || emptyEntry();
+      const wasCalled = cur.called;
+      return { ...prev, [name]: { ...cur, called: !wasCalled } };
+    });
+  };
+
+  const addFollowUp = (name) =>
+    setData((prev) => ({
+      ...prev,
+      [name]: { ...prev[name], followUps: [...prev[name].followUps, { id: newId(), text: "", done: false }] },
+    }));
+  const updateFollowUp = (name, id, field, value) =>
+    setData((prev) => ({
+      ...prev,
+      [name]: { ...prev[name], followUps: prev[name].followUps.map((f) => (f.id === id ? { ...f, [field]: value } : f)) },
+    }));
+  const removeFollowUp = (name, id) =>
+    setData((prev) => ({ ...prev, [name]: { ...prev[name], followUps: prev[name].followUps.filter((f) => f.id !== id) } }));
+
+  const addHotLead = (amName) => {
+    setHotLeads((prev) => [
+      ...prev,
+      { id: newId(), am: amName, name: "", apartemen: "", remarks: "", status: "pending", turndownReason: "", addedDate: date, resolvedDate: "" },
+    ]);
+  };
+  const updateHotLead = (id, field, value) =>
+    setHotLeads((prev) => prev.map((h) => (h.id === id ? { ...h, [field]: value } : h)));
+  const removeHotLead = (id) => setHotLeads((prev) => prev.filter((h) => h.id !== id));
+
+  const addLeadIn = (amName) => {
+    setLeadsIn((prev) => [
+      ...prev,
+      { id: newId(), am: amName, name: "", apartemen: "", remarks: "", addedDate: date },
+    ]);
+  };
+  const updateLeadIn = (id, field, value) =>
+    setLeadsIn((prev) => prev.map((l) => (l.id === id ? { ...l, [field]: value } : l)));
+  const removeLeadIn = (id) => setLeadsIn((prev) => prev.filter((l) => l.id !== id));
+
+  // Upload excel/csv berisi leads in kemarin: kolom nama owner, nama apartemen, nama AM.
+  // Baris otomatis dicocokkan ke AM yang ada di daftar (case-insensitive) dan ditandai
+  // tanggal masuk = tanggal yang lagi dibuka di tab "Hari Ini" (jadi langsung muncul hari itu,
+  // dan otomatis ilang begitu tanggalnya ganti — sama kayak nambah manual).
+  const handleLeadsFileChange = async (ev) => {
+    const file = ev.target.files && ev.target.files[0];
+    ev.target.value = "";
+    if (!file) return;
+    setUploading(true);
+    setUploadMsg("");
+    try {
+      const buf = await file.arrayBuffer();
+      const wb = XLSX.read(buf, { type: "array" });
+      const sheet = wb.Sheets[wb.SheetNames[0]];
+      const rows = XLSX.utils.sheet_to_json(sheet, { header: 1, defval: "" });
+      if (!rows || rows.length === 0) {
+        setUploadMsg("⚠️ File kosong atau gak kebaca.");
+        setUploading(false);
+        return;
+      }
+      const headers = (rows[0] || []).map((h) => String(h || ""));
+      const findCol = (matcher) => {
+        for (let i = 0; i < headers.length; i++) if (matcher(headers[i])) return i;
+        return -1;
+      };
+      let ownerIdx = findCol((h) => /owner/i.test(h));
+      let aptIdx = findCol((h) => /apart/i.test(h));
+      let amIdx = findCol((h) => /\bam\b/i.test(h) || /acquisition/i.test(h) || /manager/i.test(h));
+      const hasHeaderRow = ownerIdx !== -1 || aptIdx !== -1 || amIdx !== -1;
+      if (ownerIdx === -1) ownerIdx = 0;
+      if (aptIdx === -1) aptIdx = 1;
+      if (amIdx === -1) amIdx = 2;
+      const dataRows = hasHeaderRow ? rows.slice(1) : rows;
+
+      const amMap = {};
+      amList.forEach((n) => {
+        amMap[n.trim().toLowerCase()] = n;
+      });
+      const unmatchedAm = new Set();
+      const newEntries = [];
+      dataRows.forEach((r) => {
+        const ownerVal = String((r && r[ownerIdx]) ?? "").trim();
+        const aptVal = String((r && r[aptIdx]) ?? "").trim();
+        const amValRaw = String((r && r[amIdx]) ?? "").trim();
+        if (!ownerVal && !aptVal && !amValRaw) return;
+        const matched = amMap[amValRaw.toLowerCase()];
+        if (!matched && amValRaw) unmatchedAm.add(amValRaw);
+        newEntries.push({
+          id: newId(),
+          am: matched || amValRaw || "(AM tidak dikenali)",
+          name: ownerVal,
+          apartemen: aptVal,
+          remarks: "",
+          addedDate: date,
+        });
+      });
+
+      if (newEntries.length === 0) {
+        setUploadMsg("⚠️ Gak ada baris data yang kebaca dari file itu.");
+      } else {
+        setLeadsIn((prev) => [...prev, ...newEntries]);
+        let msg = `✅ ${newEntries.length} leads in kemarin berhasil diimpor untuk ${fmtShort(date)}`;
+        if (unmatchedAm.size) msg += ` — AM gak dikenal: ${[...unmatchedAm].join(", ")}`;
+        setUploadMsg(msg);
+      }
+    } catch (e) {
+      console.error("gagal upload leads in", e);
+      setUploadMsg("⚠️ Gagal membaca file. Pastikan formatnya .xlsx, .xls, atau .csv.");
+    } finally {
+      setUploading(false);
+      setTimeout(() => setUploadMsg(""), 7000);
+    }
+  };
+
+  const addGmeet = (amName) => {
+    setGmeetToday((prev) => [
+      ...prev,
+      { id: newId(), am: amName, name: "", apartemen: "", remarks: "", date: date },
+    ]);
+  };
+  const updateGmeet = (id, field, value) =>
+    setGmeetToday((prev) => prev.map((g) => (g.id === id ? { ...g, [field]: value } : g)));
+  const removeGmeet = (id) => setGmeetToday((prev) => prev.filter((g) => g.id !== id));
+
+  const isToday = date === todayISO();
+  const nowHour = new Date().getHours();
+
+  // AM yang gak kepilih di tim manapun
+  const unassignedList = amList.filter((n) => !teams.some((t) => t.memberNames.includes(n)));
+
+  const selectTeamTab = (id) => {
+    setActiveTeamTab(id);
+    try { localStorage.setItem("am-tracker-team-tab", id); } catch (e) {}
+  };
+
+  const filteredAmList =
+    activeTeamTab === "all"
+      ? amList
+      : activeTeamTab === "unassigned"
+      ? unassignedList
+      : (teams.find((t) => t.id === activeTeamTab)?.memberNames || []).filter((n) => amList.includes(n));
+
+  const selectedTeam = teams.find((t) => t.id === activeTeamTab) || null;
+  const teamSummary = selectedTeam
+    ? (() => {
+        const members = selectedTeam.memberNames.filter((n) => amList.includes(n));
+        let signToday = 0, signMtd = 0, hoToday = 0, hoMtd = 0;
+        members.forEach((n) => {
+          const e = data[n] || emptyEntry();
+          const mtdSign = Number(e.sign) || 0;
+          const mtdHo = Number(e.ho) || 0;
+          signMtd += mtdSign;
+          hoMtd += mtdHo;
+          signToday += Math.max(0, mtdSign - (Number(signBaseline[n]) || 0));
+          hoToday += Math.max(0, mtdHo - (Number(hoBaseline[n]) || 0));
+        });
+        return { team: selectedTeam, members, signToday, signMtd, hoToday, hoMtd };
+      })()
+    : null;
+
+  const pendingFor = (name) => hotLeads.filter((h) => h.am === name && h.status === "pending");
+  const totalPending = hotLeads.filter((h) => h.status === "pending" && filteredAmList.includes(h.am)).length;
+
+  // "Leads In" nempel ke tanggal yang lagi dibuka — sama kaya Gmeet, ditambahin/diupload
+  // hari ini, muncul hari ini, dan otomatis ilang begitu tanggalnya ganti (gak nge-gantung).
+  const pendingLeadsInFor = (name) => leadsIn.filter((l) => l.am === name && l.addedDate === date);
+  const totalPendingLeadsIn = leadsIn.filter((l) => l.addedDate === date && filteredAmList.includes(l.am)).length;
+
+  // Gmeet cuma nempel di tanggal yang lagi dibuka (bukan nge-gantung kaya hot leads/leads in)
+  const gmeetFor = (name) => gmeetToday.filter((g) => g.am === name && g.date === date);
+  const totalGmeetToday = gmeetToday.filter((g) => g.date === date && filteredAmList.includes(g.am)).length;
+
+  // Catatan: klik "✅ Sign" di hot lead SENGAJA gak ikut nambahin total sign di bawah ini.
+  // Sign/HO MTD = angka kumulatif manual per-AM, dijumlah AM yang lagi ditampilin (ngikutin filter tim).
+  const stats = filteredAmList.reduce(
+    (acc, n) => {
+      const e = data[n] || emptyEntry();
+      acc.called += e.called ? 1 : 0;
+      acc.signs += Number(e.sign) || 0;
+      acc.ho += Number(e.ho) || 0;
+      return acc;
+    },
+    { called: 0, signs: 0, ho: 0 }
+  );
+
+  const weeklyRow = (name) => {
+    if (!weekly) return null;
+    const base = weekly.byAm[name] || { signs: 0, calledDays: 0, followUps: [] };
+    const range = weekly.range;
+    const newThisWeek = hotLeads.filter((h) => h.am === name && range.includes(h.addedDate));
+    const closingThisWeek = hotLeads.filter((h) => h.am === name && h.status === "closing" && range.includes(h.resolvedDate));
+    const turndownThisWeek = hotLeads.filter((h) => h.am === name && h.status === "turndown" && range.includes(h.resolvedDate));
+    const pendingNow = pendingFor(name);
+    // "Sign" = murni dari angka manual (delta minggu ini). Hot lead yang di-klik "Sign" (closingThisWeek)
+    // SENGAJA gak ditambahin ke sini lagi — itu cuma status hot lead, bukan sumber angka sign.
+    const totalSign = base.signs || 0;
+    const totalHo = base.ho || 0;
+    return { ...base, newThisWeek, closingThisWeek, turndownThisWeek, pendingNow, totalSign, totalHo };
+  };
+
+  const buildSummary = () => {
+    if (!weekly) return "";
+    const range = `${fmtShort(weekStart)} - ${fmtShort(shiftDate(weekStart, 4))}`;
+    const rows = amList.map((n) => ({ name: n, r: weeklyRow(n) }));
+    const sorted = [...rows].sort((a, b) => b.r.totalSign - a.r.totalSign);
+    const lines = [`RINGKASAN MINGGUAN AM (${range})`, ""];
+    sorted.forEach(({ name, r }, i) => {
+      const openFollow = r.followUps.filter((f) => !f.done).length;
+      lines.push(
+        `${i + 1}. ${name} — Hot Leads Baru: ${r.newThisWeek.length} | Turndown: ${r.turndownThisWeek.length} | Sign: ${r.totalSign} | HO: ${r.totalHo} | Isi Data: ${r.calledDays}/5 hari${
+          r.pendingNow.length ? ` | Pending (belum ada jawaban): ${r.pendingNow.length}` : ""
+        }${openFollow ? ` | Follow up belum selesai: ${openFollow}` : ""}`
+      );
+    });
+    const zeroCall = rows.filter((x) => x.r.calledDays === 0).map((x) => x.name);
+    if (zeroCall.length) {
+      lines.push("");
+      lines.push(`Belum ditelepon sama sekali minggu ini: ${zeroCall.join(", ")}`);
+    }
+    const turndownLines = rows.flatMap((x) => x.r.turndownThisWeek.map((h) => `${x.name} — ${h.name || "-"} (${h.apartemen || "-"}): ${h.turndownReason || "-"}${h.remarks ? ` [${h.remarks}]` : ""}`));
+    if (turndownLines.length) {
+      lines.push("");
+      lines.push("Detail Turndown minggu ini:");
+      turndownLines.forEach((l) => lines.push(`- ${l}`));
+    }
+    return lines.join("\n");
+  };
+
+  const buildTable = () => {
+    if (!weekly) return "";
+    const header = ["Nama AM", "Hari Isi Data", "Hot Leads Baru", "Turndown", "Detail Turndown", "Sign", "HO", "Pending (belum ada jawaban)", "Follow Up Belum Selesai"];
+    const rows = [header.join("\t")];
+    const withRows = amList.map((n) => ({ name: n, r: weeklyRow(n) }));
+    const sorted = [...withRows].sort((a, b) => b.r.totalSign - a.r.totalSign);
+    sorted.forEach(({ name, r }) => {
+      const turndownDetail = r.turndownThisWeek.map((h) => `${h.name || "-"} (${h.apartemen || "-"}): ${h.turndownReason || "-"}${h.remarks ? ` [${h.remarks}]` : ""}`).join("; ") || "-";
+      const pendingDetail = r.pendingNow.map((h) => `${h.name || "-"} (${h.apartemen || "-"})${h.remarks ? ` [${h.remarks}]` : ""}`).join("; ") || "-";
+      const openFollow = r.followUps.filter((f) => !f.done).map((f) => f.text).join("; ") || "-";
+      rows.push([name, `${r.calledDays}/5`, r.newThisWeek.length, r.turndownThisWeek.length, turndownDetail, r.totalSign, r.totalHo, pendingDetail, openFollow].join("\t"));
+    });
+    return rows.join("\n");
+  };
+
+  const briefingRow = (name) => {
+    const e = (briefingData && briefingData[name]) || emptyEntry();
+    const pendingLeads = pendingFor(name);
+    const closing = hotLeads.filter((h) => h.am === name && h.status === "closing" && h.resolvedDate === date);
+    const turndown = hotLeads.filter((h) => h.am === name && h.status === "turndown" && h.resolvedDate === date);
+    const mtdSign = Number(e.sign) || 0;
+    // Sign Today = sign MTD tanggal ini dikurangi sign MTD sehari sebelumnya.
+    const todaySign = Math.max(0, mtdSign - (Number(signBaseline[name]) || 0));
+    const mtdHo = Number(e.ho) || 0;
+    const todayHo = Math.max(0, mtdHo - (Number(hoBaseline[name]) || 0));
+    const pendingLeadsIn = pendingLeadsInFor(name);
+    const gmeet = gmeetFor(name);
+    return { called: e.called, mtdSign, todaySign, mtdHo, todayHo, pendingLeads, closing, turndown, followUps: e.followUps || [], pendingLeadsIn, gmeet };
+  };
+
+  const buildBriefingSummary = () => {
+    if (!briefingData) return "";
+    const rows = amList.map((n) => ({ name: n, r: briefingRow(n) }));
+    const totals = rows.reduce(
+      (acc, x) => {
+        acc.called += x.r.called ? 1 : 0;
+        acc.pendingLeads += x.r.pendingLeads.length;
+        acc.turndown += x.r.turndown.length;
+        acc.mtdSign += x.r.mtdSign;
+        acc.todaySign += x.r.todaySign;
+        acc.mtdHo += x.r.mtdHo;
+        acc.todayHo += x.r.todayHo;
+        acc.pendingLeadsIn += x.r.pendingLeadsIn.length;
+        acc.gmeet += x.r.gmeet.length;
+        return acc;
+      },
+      { called: 0, pendingLeads: 0, turndown: 0, mtdSign: 0, todaySign: 0, mtdHo: 0, todayHo: 0, pendingLeadsIn: 0, gmeet: 0 }
+    );
+    const DIVIDER = "──────────────";
+    const lines = [];
+    lines.push(`*RANGKUMAN HARIAN*`);
+    lines.push(`_${fmtLabel(date)}_`);
+    lines.push("");
+    lines.push(`✅ Sudah Isi Data: ${totals.called}/${amList.length}`);
+    lines.push(`🔥 Hot Leads Pending: ${totals.pendingLeads}`);
+    lines.push(`🆕 Leads In Kemarin: ${totals.pendingLeadsIn}`);
+    lines.push(`📅 Gmeet Hari Ini: ${totals.gmeet}`);
+    lines.push(`✅ Sign Total MTD: ${totals.mtdSign}`);
+    lines.push(`✅ Sign Today: ${totals.todaySign}`);
+    lines.push(`🔑 HO Total MTD: ${totals.mtdHo}`);
+    lines.push(`🔑 HO Today: ${totals.todayHo}`);
+    lines.push(`❌ Turndown: ${totals.turndown}`);
+    lines.push("");
+    lines.push(DIVIDER);
+
+    const active = rows.filter(
+      (x) =>
+        x.r.called ||
+        x.r.pendingLeads.length ||
+        x.r.turndown.length ||
+        x.r.mtdSign > 0 ||
+        x.r.followUps.some((f) => !f.done) ||
+        x.r.pendingLeadsIn.length ||
+        x.r.gmeet.length
+    );
+    active.forEach(({ name, r }) => {
+      lines.push("");
+      lines.push(`*${name}*`);
+      lines.push(r.called ? "✅ Sudah isi data hari ini" : "❌ Belum isi data hari ini");
+      if (r.pendingLeadsIn.length) {
+        lines.push(`🆕 Leads In (Kemarin) (${r.pendingLeadsIn.length}):`);
+        r.pendingLeadsIn.forEach((l) => lines.push(`   • ${l.name || "-"} — ${l.apartemen || "-"}${l.remarks ? ` (${l.remarks})` : ""}`));
+      }
+      if (r.gmeet.length) {
+        lines.push(`📅 Gmeet Hari Ini (${r.gmeet.length}):`);
+        r.gmeet.forEach((g) => lines.push(`   • ${g.name || "-"} — ${g.apartemen || "-"}${g.remarks ? ` (${g.remarks})` : ""}`));
+      }
+      if (r.pendingLeads.length) {
+        lines.push(`🔥 Hot Leads Pending (${r.pendingLeads.length}):`);
+        r.pendingLeads.forEach((h) => lines.push(`   • ${h.name || "-"} — ${h.apartemen || "-"}${h.remarks ? ` (${h.remarks})` : ""}`));
+      }
+      if (r.mtdSign > 0) {
+        lines.push(`✅ Sign Total MTD: ${r.mtdSign}${r.todaySign > 0 ? ` (Today: ${r.todaySign})` : ""}`);
+      }
+      if (r.mtdHo > 0) {
+        lines.push(`🔑 HO Total MTD: ${r.mtdHo}${r.todayHo > 0 ? ` (Today: ${r.todayHo})` : ""}`);
+      }
+      if (r.turndown.length) {
+        lines.push(`❌ Turndown (${r.turndown.length}):`);
+        r.turndown.forEach((h) => lines.push(`   • ${h.name || "-"} — ${h.turndownReason || "-"}${h.remarks ? ` (${h.remarks})` : ""}`));
+      }
+      const openFollow = r.followUps.filter((f) => !f.done);
+      if (openFollow.length) {
+        lines.push(`📋 Follow up belum selesai:`);
+        openFollow.forEach((f) => lines.push(`   • ${f.text}`));
+      }
+    });
+
+    const notCalled = rows.filter((x) => !x.r.called).map((x) => x.name);
+    if (notCalled.length) {
+      lines.push("");
+      lines.push(DIVIDER);
+      lines.push("");
+      lines.push(`❗ *Belum isi data (${notCalled.length}):*`);
+      notCalled.forEach((n) => lines.push(`   • ${n}`));
+    }
+    return lines.join("\n");
+  };
+
+  const copyBriefing = async () => {
+    try {
+      await navigator.clipboard.writeText(buildBriefingSummary());
+      setCopiedBriefing(true);
+      setTimeout(() => setCopiedBriefing(false), 1600);
+    } catch (e) {}
+  };
+
+  const hotLeadsRows = () => {
+    const statusLabel = { pending: "Pending", closing: "Sign", turndown: "Turndown" };
+    const header = ["AM", "Nama Calon Owner", "Apartemen", "Status", "Remarks", "Alasan Turndown", "Tanggal Ditambahkan", "Tanggal Resolved"];
+    const body = hotLeads.map((h) => [h.am, h.name || "-", h.apartemen || "-", statusLabel[h.status] || h.status, h.remarks || "", h.turndownReason || "", h.addedDate || "", h.resolvedDate || ""]);
+    return [header, ...body];
+  };
+  const downloadHotLeadsCSV = () => downloadCSV(`hot-leads-am-${todayISO()}.csv`, toCSV(hotLeadsRows()));
+  const copyHotLeadsCSV = async () => {
+    try {
+      await navigator.clipboard.writeText(toTSV(hotLeadsRows()));
+      setCopiedHotLeadsCSV(true);
+      setTimeout(() => setCopiedHotLeadsCSV(false), 1600);
+    } catch (e) {}
+  };
+
+  const leadsInRows = () => {
+    const header = ["AM", "Nama Owner", "Apartemen", "Remarks", "Tanggal Masuk"];
+    const body = leadsIn.map((l) => [l.am, l.name || "-", l.apartemen || "-", l.remarks || "", l.addedDate || ""]);
+    return [header, ...body];
+  };
+  const downloadLeadsInCSV = () => downloadCSV(`leads-in-am-${todayISO()}.csv`, toCSV(leadsInRows()));
+  const copyLeadsInCSV = async () => {
+    try {
+      await navigator.clipboard.writeText(toTSV(leadsInRows()));
+      setCopiedLeadsInCSV(true);
+      setTimeout(() => setCopiedLeadsInCSV(false), 1600);
+    } catch (e) {}
+  };
+
+  const gmeetRows = () => {
+    const header = ["AM", "Nama Owner", "Apartemen", "Remarks", "Tanggal"];
+    const body = gmeetToday.map((g) => [g.am, g.name || "-", g.apartemen || "-", g.remarks || "", g.date || ""]);
+    return [header, ...body];
+  };
+  const downloadGmeetCSV = () => downloadCSV(`gmeet-am-${todayISO()}.csv`, toCSV(gmeetRows()));
+  const copyGmeetCSV = async () => {
+    try {
+      await navigator.clipboard.writeText(toTSV(gmeetRows()));
+      setCopiedGmeetCSV(true);
+      setTimeout(() => setCopiedGmeetCSV(false), 1600);
+    } catch (e) {}
+  };
+
+  const fetchDailyLogRows = async () => {
+    const header = ["Tanggal", "AM", "Tim", "Sudah Isi Data", "Sign (Hari Ini)", "Sign (Kumulatif)", "HO (Hari Ini)", "HO (Kumulatif)", "Follow Up"];
+    const listRes = await window.storage.list("day:");
+    const keys = (listRes && listRes.keys) || [];
+    const byName = {};
+    for (const key of keys) {
+      try {
+        const res = await window.storage.get(key);
+        if (!res || !res.value) continue;
+        const dateStr = key.replace(/^day:/, "");
+        const parsed = JSON.parse(res.value);
+        amList.forEach((name) => {
+          const e = parsed[name];
+          if (!e) return;
+          const followUpsText = (Array.isArray(e.followUps) ? e.followUps : []).map((f) => `${f.done ? "[selesai]" : "[belum]"} ${f.text}`).join(" | ") || "-";
+          if (!byName[name]) byName[name] = [];
+          byName[name].push({ dateStr, called: e.called, signCum: Number(e.sign) || 0, hoCum: Number(e.ho) || 0, followUpsText });
+        });
+      } catch (e) {}
+    }
+    const teamNameOf = (name) => {
+      const t = teams.find((t) => t.memberNames.includes(name));
+      return t ? t.name : "Belum dikelompokkan";
+    };
+    // sign & ho disimpan kumulatif, jadi "hari ini" per AM = selisih dari hari sebelumnya yang tercatat
+    const body = [];
+    Object.keys(byName).forEach((name) => {
+      const rows = byName[name].sort((a, b) => a.dateStr.localeCompare(b.dateStr));
+      let prevSignCum = null;
+      let prevHoCum = null;
+      rows.forEach((r) => {
+        const signDelta = prevSignCum === null ? r.signCum : Math.max(0, r.signCum - prevSignCum);
+        const hoDelta = prevHoCum === null ? r.hoCum : Math.max(0, r.hoCum - prevHoCum);
+        prevSignCum = r.signCum;
+        prevHoCum = r.hoCum;
+        body.push([r.dateStr, name, teamNameOf(name), r.called ? "Ya" : "Tidak", String(signDelta), String(r.signCum), String(hoDelta), String(r.hoCum), r.followUpsText]);
+      });
+    });
+    body.sort((a, b) => a[0].localeCompare(b[0]) || a[1].localeCompare(b[1]));
+    return [header, ...body];
+  };
+
+  const downloadFullBackupJSON = async () => {
+    setBackingUpJson(true);
+    try {
+      const listRes = await window.storage.list("");
+      const keys = (listRes && listRes.keys) || [];
+      const dump = {};
+      for (const k of keys) {
+        try {
+          const res = await window.storage.get(k);
+          dump[k] = res.value;
+        } catch (e) {}
+      }
+      const payload = { exportedAt: new Date().toISOString(), data: dump };
+      const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = `am-tracker-backup-${todayISO()}.json`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      alert("Gagal backup JSON: " + e.message);
+    } finally {
+      setBackingUpJson(false);
+    }
+  };
+
+  const downloadFullBackupExcel = async () => {
+    setBackingUpExcel(true);
+    try {
+      const wb = XLSX.utils.book_new();
+      const amRows = [["Nama AM", "Tim", "Ketua Tim"]];
+      amList.forEach((name) => {
+        const t = teams.find((tm) => tm.memberNames.includes(name));
+        amRows.push([name, t ? t.name : "Belum dikelompokkan", t && t.leaderName ? t.leaderName : "-"]);
+      });
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(amRows), "AM & Tim");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(hotLeadsRows()), "Hot Leads");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(leadsInRows()), "Leads In");
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(gmeetRows()), "Gmeet");
+      const logRows = await fetchDailyLogRows();
+      XLSX.utils.book_append_sheet(wb, XLSX.utils.aoa_to_sheet(logRows), "Log Harian");
+      XLSX.writeFile(wb, `am-tracker-backup-${todayISO()}.xlsx`);
+    } catch (e) {
+      alert("Gagal backup Excel: " + e.message);
+    } finally {
+      setBackingUpExcel(false);
+    }
+  };
+
+  const downloadDailyLogCSV = async () => {
+    setExportingLog(true);
+    try {
+      const rows = await fetchDailyLogRows();
+      setLastLogCSVRows(rows);
+      downloadCSV(`log-harian-am-${todayISO()}.csv`, toCSV(rows));
+    } finally {
+      setExportingLog(false);
+    }
+  };
+
+  const copyDailyLogCSV = async () => {
+    setExportingLog(true);
+    try {
+      const rows = lastLogCSVRows || (await fetchDailyLogRows());
+      setLastLogCSVRows(rows);
+      await navigator.clipboard.writeText(toTSV(rows));
+      setCopiedLogCSV(true);
+      setTimeout(() => setCopiedLogCSV(false), 1600);
+    } catch (e) {
+    } finally {
+      setExportingLog(false);
+    }
+  };
+
+  const handleCopy = async (kind) => {
+    const text = kind === "summary" ? buildSummary() : buildTable();
+    try {
+      await navigator.clipboard.writeText(text);
+      if (kind === "summary") {
+        setCopiedSummary(true);
+        setTimeout(() => setCopiedSummary(false), 1600);
+      } else {
+        setCopiedTable(true);
+        setTimeout(() => setCopiedTable(false), 1600);
+      }
+    } catch (e) {}
+  };
+
+  return (
+    <div className="wrap">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
+        .wrap {
+          --bg: #FBF6F0; --panel: #FFFFFF; --ink: #23262B; --muted: #8A7F74; --line: #ECE2D6;
+          --done: #2E9E63; --done-bg: #E7F7EE; --pending: #D97706; --pending-bg: #FBEEDA;
+          --hot: #E0921F; --hot-bg: #FCF0DC;
+          --brand: #E4463A; --brand-dark: #C93A2F; --brand-bg: #FCEAE7;
+          font-family: 'Poppins', ui-sans-serif, system-ui, sans-serif;
+          background: var(--bg); color: var(--ink); border-radius: 16px; padding: 20px;
+          max-width: 760px; margin: 0 auto; font-variant-numeric: tabular-nums;
+        }
+        .wrap * { box-sizing: border-box; }
+        .display { font-family: 'Poppins', ui-sans-serif, sans-serif; font-weight: 800; }
+        .title { font-size: 20px; font-weight: 800; letter-spacing: -0.01em; color: var(--brand); }
+        .subtitle { font-size: 12.5px; color: var(--muted); margin-top: 2px; margin-bottom: 16px; }
+        .brandbar { display: flex; align-items: center; gap: 10px; margin-bottom: 2px; }
+        .brandlogo { height: 26px; width: auto; display: block; }
+        .brandsep { color: var(--line); font-size: 18px; font-weight: 300; }
+        .brandlabel { font-size: 16px; font-weight: 800; color: var(--ink); letter-spacing: -0.01em; }
+        .tabs { display: flex; gap: 4px; background: var(--panel); border: 1px solid var(--line); border-radius: 20px; padding: 4px; margin-bottom: 16px; width: fit-content; flex-wrap: wrap; }
+        .tab { border: none; background: transparent; padding: 7px 14px; font-size: 13px; font-weight: 600; color: var(--muted); border-radius: 999px; cursor: pointer; font-family: inherit; display: flex; align-items: center; gap: 5px; }
+        .tab.active { background: var(--brand); color: #fff; }
+        .datebar, .weekbar { display: flex; align-items: center; justify-content: space-between; border: 1px solid var(--line); background: var(--panel); border-radius: 12px; padding: 8px 10px; margin-bottom: 12px; }
+        .datebar .label, .weekbar .label { font-weight: 600; font-size: 14px; text-transform: capitalize; }
+        .navbtn { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; width: 28px; height: 28px; display: flex; align-items: center; justify-content: center; cursor: pointer; color: var(--ink); }
+        .navbtn:hover { background: var(--line); }
+        .today-pill { font-size: 11px; color: var(--brand); background: var(--brand-bg); padding: 2px 8px; border-radius: 20px; font-weight: 600; margin-left: 8px; }
+        .stats { display: flex; gap: 8px; margin-bottom: 14px; }
+        .stat { flex: 1; border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 10px 12px; }
+        .stat .n { font-size: 22px; font-weight: 700; }
+        .stat .l { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+        .upload-bar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+        .uploadbtn { border: 1px solid var(--brand); background: var(--brand); color: #fff; font-size: 12.5px; font-weight: 600; padding: 8px 14px; border-radius: 999px; cursor: pointer; font-family: inherit; }
+        .uploadbtn:disabled { opacity: 0.6; cursor: default; }
+        .upload-msg { font-size: 12px; color: var(--muted); line-height: 1.4; }
+        .list { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
+        .row { border-bottom: 1px solid var(--line); }
+        .row:last-child { border-bottom: none; }
+        .row.reminder { background: var(--hot-bg); }
+        .row-main { display: flex; align-items: center; gap: 8px; padding: 10px 12px; flex-wrap: wrap; }
+        .fillbtn { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; width: 30px; height: 30px; flex-shrink: 0; display: flex; align-items: center; justify-content: center; cursor: pointer; font-size: 14px; }
+        .fillbtn.on { background: var(--done); border-color: var(--done); color: #fff; }
+        .fillstatus { font-size: 10.5px; font-weight: 700; color: var(--muted); background: var(--panel); border: 1px solid var(--line); border-radius: 5px; padding: 2px 6px; flex-shrink: 0; }
+        .fillstatus.warn { color: var(--hot); border-color: var(--hot); background: var(--hot-bg); }
+        .name { flex: 1; font-size: 13.5px; font-weight: 500; min-width: 90px; display: flex; align-items: center; gap: 6px; }
+        .name span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+        .mini-field { display: flex; align-items: center; gap: 4px; }
+        .mini-field input { width: 40px; text-align: center; border: 1px solid var(--line); border-radius: 6px; padding: 4px 2px; font-size: 13px; font-family: inherit; font-variant-numeric: tabular-nums; background: var(--bg); color: var(--ink); }
+        .mini-field label { font-size: 15px; }
+        .countpill { font-size: 11px; background: var(--hot-bg); color: var(--hot); border-radius: 20px; padding: 1px 6px; font-weight: 600; }
+        .countpill.leadsin { background: #E4E9F7; color: #38508C; }
+        .countpill.gmeet { background: var(--pending-bg); color: var(--pending); }
+        .expbtn { border: none; background: transparent; cursor: pointer; color: var(--muted); display: flex; font-size: 14px; }
+        .detail-panel { padding: 4px 12px 14px 52px; display: flex; flex-direction: column; gap: 14px; }
+        .section-label { font-size: 11.5px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: 0.04em; margin-bottom: 6px; }
+        .hl-card { border: 1px solid var(--line); border-radius: 12px; padding: 8px; margin-bottom: 8px; background: var(--bg); }
+        .hl-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+        .hl-row input, .fu-row input[type=text] { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 13px; font-family: inherit; background: var(--panel); color: var(--ink); }
+        .hl-row input.hl-name { flex: 1; }
+        .hl-row input.hl-apt { flex: 1; }
+        .hl-row input.hl-remarks { flex: 1; font-size: 12.5px; }
+        .hl-meta { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+        .hl-age { font-size: 11px; color: var(--muted); display: flex; align-items: center; gap: 3px; }
+        .fu-row { display: flex; gap: 6px; align-items: center; margin-bottom: 6px; }
+        .fu-row input[type=text] { flex: 1; }
+        .fu-row.done input[type=text] { text-decoration: line-through; color: var(--muted); }
+        .iconbtn { border: none; background: transparent; cursor: pointer; color: var(--muted); display: flex; flex-shrink: 0; font-size: 14px; }
+        .iconbtn:hover { color: var(--brand); }
+        .addbtn { display: flex; align-items: center; gap: 4px; border: 1px dashed var(--line); background: transparent; border-radius: 6px; padding: 5px 9px; font-size: 12px; color: var(--muted); cursor: pointer; font-family: inherit; }
+        .addbtn:hover { border-color: var(--done); color: var(--done); }
+        .weeklist { display: flex; flex-direction: column; gap: 8px; }
+        .wk-row { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 10px 12px; }
+        .wk-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; flex-wrap: wrap; }
+        .wk-name { font-weight: 600; font-size: 13.5px; }
+        .wk-badges { display: flex; gap: 6px; flex-shrink: 0; flex-wrap: wrap; }
+        .badge { font-size: 11.5px; font-weight: 600; padding: 2px 7px; border-radius: 20px; display: flex; align-items: center; gap: 3px; }
+        .badge.hot { background: var(--hot-bg); color: var(--hot); }
+        .badge.sign { background: var(--done-bg); color: var(--done); }
+        .badge.calls { background: var(--pending-bg); color: var(--pending); }
+        .badge.zero { background: var(--hot-bg); color: var(--hot); }
+        .badge.open { background: var(--pending-bg); color: var(--pending); }
+        .badge.closing { background: var(--done-bg); color: var(--done); }
+        .wk-detail { font-size: 12px; color: var(--muted); margin-top: 6px; line-height: 1.5; }
+        .summary-box { margin-top: 14px; border: 1px solid var(--line); border-radius: 14px; background: var(--panel); padding: 10px 12px; }
+        .summary-box .row-head { display: flex; align-items: center; justify-content: space-between; }
+        .summary-box .row-head + .row-head { margin-top: 10px; }
+        .summary-box .label2 { display: flex; align-items: center; gap: 6px; font-size: 13px; font-weight: 600; }
+        .summary-box pre { white-space: pre-wrap; font-family: 'Poppins', sans-serif; font-size: 12px; color: var(--ink); margin: 8px 0 0 0; line-height: 1.5; max-height: 220px; overflow: auto; }
+        .copybtn { border: 1px solid var(--brand); background: var(--brand); color: #fff; font-size: 12.5px; font-weight: 600; padding: 6px 12px; border-radius: 999px; display: flex; align-items: center; gap: 5px; cursor: pointer; font-family: inherit; }
+        .copybtn.copied { background: var(--done); border-color: var(--done); }
+        .empty { padding: 24px 12px; text-align: center; color: var(--muted); font-size: 13px; }
+        .manage-note { font-size: 12px; color: var(--muted); margin-bottom: 12px; line-height: 1.5; }
+        .manage-add { display: flex; gap: 8px; margin-bottom: 14px; }
+        .manage-add input { flex: 1; border: 1px solid var(--line); border-radius: 8px; padding: 9px 11px; font-size: 13.5px; font-family: inherit; background: var(--panel); color: var(--ink); }
+        .manage-addbtn { border: 1px solid var(--brand); background: var(--brand); color: #fff; border-radius: 999px; padding: 0 16px; font-size: 13px; font-weight: 600; display: flex; align-items: center; gap: 5px; cursor: pointer; font-family: inherit; }
+        .manage-list { border: 1px solid var(--line); border-radius: 14px; background: var(--panel); overflow: hidden; }
+        .manage-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 12px; border-bottom: 1px solid var(--line); font-size: 13.5px; }
+        .manage-row:last-child { border-bottom: none; }
+        .manage-team-select { border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-size: 12px; font-family: inherit; background: var(--bg); color: var(--ink); }
+
+        .subtabs { margin-bottom: 12px; }
+        .trend-controls { display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 14px; flex-wrap: wrap; }
+        .trend-range-select { border: 1px solid var(--line); border-radius: 6px; padding: 6px 8px; font-size: 12.5px; font-family: inherit; background: var(--panel); color: var(--ink); }
+        .badge.ho { background: #E4E9F7; color: #38508C; }
+
+        .team-summary-card { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 12px; margin-bottom: 14px; }
+        .team-summary-title { font-size: 13px; font-weight: 700; margin-bottom: 10px; }
+        .team-summary-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+        .team-summary-item { border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 8px 10px; text-align: center; }
+        .team-summary-item .n { font-size: 18px; font-weight: 700; }
+        .team-summary-item .l { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+
+        .kanban { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 8px; }
+        .kanban-col { flex: 0 0 200px; border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; gap: 8px; transition: background 0.15s, border-color 0.15s; }
+        .kanban-col.drag-over { background: var(--done-bg); border-color: var(--done); }
+        .kanban-col-head { display: flex; align-items: center; justify-content: space-between; gap: 6px; }
+        .kanban-col-title { font-size: 13px; font-weight: 700; }
+        .kanban-col-title-input { flex: 1; border: none; background: transparent; font-size: 13px; font-weight: 700; font-family: inherit; color: var(--ink); border-bottom: 1px dashed var(--line); padding: 2px 0; min-width: 0; }
+        .kanban-col-title-input:focus { outline: none; border-bottom-color: var(--done); }
+        .kanban-col-count { font-size: 11px; color: var(--muted); font-weight: 600; }
+        .kanban-leader-select { width: 100%; border: 1px solid var(--line); border-radius: 6px; padding: 4px 6px; font-size: 11.5px; font-family: inherit; background: var(--bg); color: var(--muted); }
+        .kanban-col-body { display: flex; flex-direction: column; gap: 6px; min-height: 40px; }
+        .kanban-empty { font-size: 11px; color: var(--muted); text-align: center; padding: 10px 0; border: 1px dashed var(--line); border-radius: 6px; }
+        .am-card { border: 1px solid var(--line); background: var(--bg); border-radius: 6px; padding: 6px 8px; cursor: grab; display: flex; flex-direction: column; gap: 4px; }
+        .am-card:active { cursor: grabbing; }
+        .am-card-name { font-size: 12.5px; font-weight: 500; }
+        .am-card select { width: 100%; border: 1px solid var(--line); border-radius: 5px; padding: 3px 4px; font-size: 11px; font-family: inherit; background: var(--panel); color: var(--muted); }
+
+        .teamlist { display: flex; flex-direction: column; gap: 8px; }
+        .team-perf-row { border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 10px 12px; }
+        .team-perf-top { display: flex; align-items: center; justify-content: space-between; gap: 8px; cursor: pointer; flex-wrap: wrap; }
+        .team-perf-name { font-weight: 700; font-size: 14px; }
+        .team-perf-leader { font-size: 11.5px; color: var(--muted); margin-top: 1px; }
+        .team-perf-badges { display: flex; align-items: center; gap: 6px; }
+        .team-perf-members { margin-top: 10px; padding-top: 10px; border-top: 1px solid var(--line); display: flex; flex-direction: column; gap: 6px; }
+        .team-perf-member { display: flex; align-items: center; justify-content: space-between; font-size: 12.5px; }
+        .team-perf-member-nums { color: var(--muted); font-weight: 600; font-size: 12px; }
+      `}</style>
+
+      <div className="brandbar">
+        <img className="brandlogo" src="data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAACTUAAAHoCAYAAACSfJmwAAAACXBIWXMAAAsTAAALEwEAmpwYAAAF+mlUWHRYTUw6Y29tLmFkb2JlLnhtcAAAAAAAPD94cGFja2V0IGJlZ2luPSLvu78iIGlkPSJXNU0wTXBDZWhpSHpyZVN6TlRjemtjOWQiPz4gPHg6eG1wbWV0YSB4bWxuczp4PSJhZG9iZTpuczptZXRhLyIgeDp4bXB0az0iQWRvYmUgWE1QIENvcmUgNS42LWMxNDUgNzkuMTYzNDk5LCAyMDE4LzA4LzEzLTE2OjQwOjIyICAgICAgICAiPiA8cmRmOlJERiB4bWxuczpyZGY9Imh0dHA6Ly93d3cudzMub3JnLzE5OTkvMDIvMjItcmRmLXN5bnRheC1ucyMiPiA8cmRmOkRlc2NyaXB0aW9uIHJkZjphYm91dD0iIiB4bWxuczp4bXA9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC8iIHhtbG5zOmRjPSJodHRwOi8vcHVybC5vcmcvZGMvZWxlbWVudHMvMS4xLyIgeG1sbnM6cGhvdG9zaG9wPSJodHRwOi8vbnMuYWRvYmUuY29tL3Bob3Rvc2hvcC8xLjAvIiB4bWxuczp4bXBNTT0iaHR0cDovL25zLmFkb2JlLmNvbS94YXAvMS4wL21tLyIgeG1sbnM6c3RFdnQ9Imh0dHA6Ly9ucy5hZG9iZS5jb20veGFwLzEuMC9zVHlwZS9SZXNvdXJjZUV2ZW50IyIgeG1wOkNyZWF0b3JUb29sPSJBZG9iZSBQaG90b3Nob3AgQ0MgMjAxOSAoV2luZG93cykiIHhtcDpDcmVhdGVEYXRlPSIyMDE5LTAzLTA3VDE0OjE1OjE5KzA3OjAwIiB4bXA6TW9kaWZ5RGF0ZT0iMjAxOS0wNi0xMVQxNDo1MjoxMyswNzowMCIgeG1wOk1ldGFkYXRhRGF0ZT0iMjAxOS0wNi0xMVQxNDo1MjoxMyswNzowMCIgZGM6Zm9ybWF0PSJpbWFnZS9wbmciIHBob3Rvc2hvcDpDb2xvck1vZGU9IjMiIHBob3Rvc2hvcDpJQ0NQcm9maWxlPSJzUkdCIElFQzYxOTY2LTIuMSIgeG1wTU06SW5zdGFuY2VJRD0ieG1wLmlpZDoyMGI4MTEyZC1lZGU3LThlNDktOWUwMy1hN2I1MGYyM2NkZTIiIHhtcE1NOkRvY3VtZW50SUQ9ImFkb2JlOmRvY2lkOnBob3Rvc2hvcDphMTljZjc5MC05NGQ4LTcyNDQtODVlNC1kZjkwOTJmZTk4MWYiIHhtcE1NOk9yaWdpbmFsRG9jdW1lbnRJRD0ieG1wLmRpZDowNDk4NDJiNi1iMTNlLWNhNDAtOTU5NS1kM2U1MGQ3OGQ4ZWQiPiA8eG1wTU06SGlzdG9yeT4gPHJkZjpTZXE+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJjcmVhdGVkIiBzdEV2dDppbnN0YW5jZUlEPSJ4bXAuaWlkOjA0OTg0MmI2LWIxM2UtY2E0MC05NTk1LWQzZTUwZDc4ZDhlZCIgc3RFdnQ6d2hlbj0iMjAxOS0wMy0wN1QxNDoxNToxOSswNzowMCIgc3RFdnQ6c29mdHdhcmVBZ2VudD0iQWRvYmUgUGhvdG9zaG9wIENDIDIwMTkgKFdpbmRvd3MpIi8+IDxyZGY6bGkgc3RFdnQ6YWN0aW9uPSJzYXZlZCIgc3RFdnQ6aW5zdGFuY2VJRD0ieG1wLmlpZDoyMGI4MTEyZC1lZGU3LThlNDktOWUwMy1hN2I1MGYyM2NkZTIiIHN0RXZ0OndoZW49IjIwMTktMDYtMTFUMTQ6NTI6MTMrMDc6MDAiIHN0RXZ0OnNvZnR3YXJlQWdlbnQ9IkFkb2JlIFBob3Rvc2hvcCBDQyAyMDE5IChXaW5kb3dzKSIgc3RFdnQ6Y2hhbmdlZD0iLyIvPiA8L3JkZjpTZXE+IDwveG1wTU06SGlzdG9yeT4gPC9yZGY6RGVzY3JpcHRpb24+IDwvcmRmOlJERj4gPC94OnhtcG1ldGE+IDw/eHBhY2tldCBlbmQ9InIiPz7mJBHOAACiIklEQVR4nOzdz3UbR/b28WfmzJ58E2hiIiAmAsLLWgkTAeEIBEcgOAJDEagVgaFVLQ1GYDACg53AEBH83kUXLJjmPwDVfauqv59zcGTLEvoxAKK7q27d+ocAnKVxbiRpJOlS0tgwSq624fFYeb8xTQIAAAAAAAAAAAAAAJLwD+sAQE4a58aSJmqLl0aSbuzSFOtebZHTRtK68n5tGQYAAAAAAAAAAAAAAPSPoibgFY1zl5Km4TGRdGGXZtDuJK0krSrvt7ZRAAAA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" alt="Travelio" />
+        <span className="brandsep">|</span>
+        <span className="brandlabel display">AM Tracker</span>
+      </div>
+      <div className="subtitle">{amList.length} Acquisition Manager · diisi langsung oleh ketua kelompok</div>
+
+      <div className="tabs">
+        <button className={`tab ${view === "today" ? "active" : ""}`} onClick={() => setView("today")}>Hari Ini</button>
+        <button className={`tab ${view === "weekly" ? "active" : ""}`} onClick={() => setView("weekly")}>Ringkasan Mingguan</button>
+        <button className={`tab ${view === "briefing" ? "active" : ""}`} onClick={() => setView("briefing")}>📋 Rangkuman Harian</button>
+        <button className={`tab ${view === "export" ? "active" : ""}`} onClick={() => setView("export")}>⬇️ Export</button>
+        <button className={`tab ${view === "teamperf" ? "active" : ""}`} onClick={() => setView("teamperf")}>🏆 Performance Tim</button>
+        <button className={`tab ${view === "manage" ? "active" : ""}`} onClick={() => setView("manage")}>👥 Kelola AM</button>
+      </div>
+
+      {view === "today" && (
+        <>
+          {teams.length > 0 && (
+            <div className="tabs subtabs">
+              <button className={`tab ${activeTeamTab === "all" ? "active" : ""}`} onClick={() => selectTeamTab("all")}>Semua</button>
+              {teams.map((t) => (
+                <button key={t.id} className={`tab ${activeTeamTab === t.id ? "active" : ""}`} onClick={() => selectTeamTab(t.id)}>{t.name}</button>
+              ))}
+              {unassignedList.length > 0 && (
+                <button className={`tab ${activeTeamTab === "unassigned" ? "active" : ""}`} onClick={() => selectTeamTab("unassigned")}>Belum dikelompokkan</button>
+              )}
+            </div>
+          )}
+
+          {teamSummary && (
+            <div className="team-summary-card">
+              <div className="team-summary-title">
+                📊 Performance {teamSummary.team.name}
+                {teamSummary.team.leaderName ? ` — Ketua: ${teamSummary.team.leaderName}` : ""}
+              </div>
+              <div className="team-summary-grid">
+                <div className="team-summary-item"><div className="n display">{teamSummary.signToday}</div><div className="l">✅ Sign Hari Ini</div></div>
+                <div className="team-summary-item"><div className="n display">{teamSummary.signMtd}</div><div className="l">✅ Sign MTD</div></div>
+                <div className="team-summary-item"><div className="n display">{teamSummary.hoToday}</div><div className="l">🔑 HO Hari Ini</div></div>
+                <div className="team-summary-item"><div className="n display">{teamSummary.hoMtd}</div><div className="l">🔑 HO MTD</div></div>
+              </div>
+            </div>
+          )}
+
+          <div className="datebar">
+            <button className="navbtn" onClick={() => setDate((d) => shiftWorkday(d, -1))}>◂</button>
+            <div className="label">{fmtLabel(date)}{isToday && <span className="today-pill">Hari ini</span>}</div>
+            <button className="navbtn" onClick={() => setDate((d) => shiftWorkday(d, 1))}>▸</button>
+          </div>
+
+          <div className="stats">
+            <div className="stat"><div className="n display">{stats.called}/{filteredAmList.length}</div><div className="l">✅ Sudah isi data</div></div>
+            <div className="stat"><div className="n display">{totalPending}</div><div className="l">Hot leads pending</div></div>
+            <div className="stat"><div className="n display">{stats.signs}</div><div className="l">Sign MTD</div></div>
+          </div>
+          <div className="stats">
+            <div className="stat"><div className="n display">{totalPendingLeadsIn}</div><div className="l">🆕 Total Leads In Kemarin</div></div>
+            <div className="stat"><div className="n display">{totalGmeetToday}</div><div className="l">📅 Gmeet hari ini</div></div>
+            <div className="stat"><div className="n display">{stats.ho}</div><div className="l">🔑 HO MTD</div></div>
+          </div>
+
+          <div className="upload-bar">
+            <button className="uploadbtn" disabled={uploading} onClick={() => leadsFileInputRef.current && leadsFileInputRef.current.click()}>
+              {uploading ? "Mengimpor..." : "⬆️ Upload Leads Kemarin"}
+            </button>
+            <input
+              type="file"
+              accept=".xlsx,.xls,.csv"
+              ref={leadsFileInputRef}
+              style={{ display: "none" }}
+              onChange={handleLeadsFileChange}
+            />
+            {uploadMsg && <span className="upload-msg">{uploadMsg}</span>}
+          </div>
+
+          <div className="list">
+            {loading || amListLoading || teamsLoading || hotLeadsLoading || leadsInLoading || gmeetLoading ? (
+              <div className="empty">Memuat data...</div>
+            ) : amList.length === 0 ? (
+              <div className="empty">Belum ada AM. Tambahin dulu lewat tab "Kelola AM".</div>
+            ) : filteredAmList.length === 0 ? (
+              <div className="empty">Gak ada AM di kelompok ini.</div>
+            ) : (
+              filteredAmList.map((name) => {
+                const e = data[name] || emptyEntry();
+                const isOpen = expanded === name;
+                const needsReminder = isToday && !e.called && nowHour >= REMINDER_HOUR;
+                const openFollow = e.followUps.filter((f) => !f.done).length;
+                const pending = pendingFor(name);
+                const leadsInPending = pendingLeadsInFor(name);
+                const gmeetList = gmeetFor(name);
+                return (
+                  <div className={`row ${needsReminder ? "reminder" : ""}`} key={name}>
+                    <div className="row-main">
+                      <button className={`fillbtn ${e.called ? "on" : ""}`} onClick={() => toggleCalled(name)} title={e.called ? "Sudah isi data hari ini" : "Belum isi data hari ini"}>
+                        {e.called ? "✅" : needsReminder ? "⚠️" : "⬜"}
+                      </button>
+                      <div className="name"><span>{name}</span></div>
+                      {!e.called && <span className={`fillstatus ${needsReminder ? "warn" : ""}`}>{needsReminder ? "⚠️ Belum isi" : "Belum isi"}</span>}
+                      {pending.length > 0 && <span className="countpill">🔥 {pending.length}</span>}
+                      {leadsInPending.length > 0 && <span className="countpill leadsin">🆕 {leadsInPending.length}</span>}
+                      {gmeetList.length > 0 && <span className="countpill gmeet">📅 {gmeetList.length}</span>}
+                      {openFollow > 0 && <span className="countpill">📋 {openFollow}</span>}
+                      <div className="mini-field" title="Total sign kumulatif — otomatis kebawa dari hari sebelumnya, tinggal ditambah kalau ada sign baru">
+                        <label>✅</label>
+                        <input type="number" min="0" value={e.sign} onChange={(ev) => setEntry(name, { sign: ev.target.value })} />
+                      </div>
+                      <div className="mini-field" title="Total HO (handover) kumulatif — otomatis kebawa dari hari sebelumnya, tinggal ditambah kalau ada HO baru">
+                        <label>🔑</label>
+                        <input type="number" min="0" value={e.ho} onChange={(ev) => setEntry(name, { ho: ev.target.value })} />
+                      </div>
+                      <button className="expbtn" onClick={() => setExpanded(isOpen ? null : name)}>{isOpen ? "▾" : "▸"}</button>
+                    </div>
+                    {isOpen && (
+                      <div className="detail-panel">
+                        <div>
+                          <div className="section-label">Hot Leads (belum ada jawaban)</div>
+                          {pending.length === 0 && (
+                            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>Gak ada hot leads yang nge-gantung.</div>
+                          )}
+                          {pending.map((h) => (
+                            <div className="hl-card" key={h.id}>
+                              <div className="hl-row">
+                                <input className="hl-name" type="text" placeholder="Nama calon owner" value={h.name} onChange={(ev) => updateHotLead(h.id, "name", ev.target.value)} />
+                                <input className="hl-apt" type="text" placeholder="Nama apartemen" value={h.apartemen} onChange={(ev) => updateHotLead(h.id, "apartemen", ev.target.value)} />
+                                <button className="iconbtn" onClick={() => removeHotLead(h.id)} title="Hapus">✕</button>
+                              </div>
+                              <div className="hl-row">
+                                <input className="hl-remarks" type="text" placeholder="Remarks (bebas, catatan tambahan)..." value={h.remarks || ""} onChange={(ev) => updateHotLead(h.id, "remarks", ev.target.value)} />
+                              </div>
+                              <div className="hl-meta">
+                                <span className="hl-age">🕒 sejak {fmtShort(h.addedDate)}</span>
+                              </div>
+                            </div>
+                          ))}
+                          <button className="addbtn" onClick={() => addHotLead(name)}>+ Tambah Hot Lead</button>
+                        </div>
+                        <div>
+                          <div className="section-label">🆕 Leads In (Kemarin)</div>
+                          {leadsInPending.length === 0 && (
+                            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>Gak ada leads in kemarin.</div>
+                          )}
+                          {leadsInPending.map((l) => (
+                            <div className="hl-card" key={l.id}>
+                              <div className="hl-row">
+                                <input className="hl-name" type="text" placeholder="Nama owner" value={l.name} onChange={(ev) => updateLeadIn(l.id, "name", ev.target.value)} />
+                                <input className="hl-apt" type="text" placeholder="Nama apartemen" value={l.apartemen} onChange={(ev) => updateLeadIn(l.id, "apartemen", ev.target.value)} />
+                                <button className="iconbtn" onClick={() => removeLeadIn(l.id)} title="Hapus">✕</button>
+                              </div>
+                              <div className="hl-row">
+                                <input className="hl-remarks" type="text" placeholder="Remarks (bebas, catatan tambahan)..." value={l.remarks || ""} onChange={(ev) => updateLeadIn(l.id, "remarks", ev.target.value)} />
+                              </div>
+                              <div className="hl-meta">
+                                <span className="hl-age">🕒 masuk {fmtShort(l.addedDate)}</span>
+                              </div>
+                            </div>
+                          ))}
+                          <button className="addbtn" onClick={() => addLeadIn(name)}>+ Tambah Leads In</button>
+                        </div>
+                        <div>
+                          <div className="section-label">📅 Gmeet Hari Ini</div>
+                          {gmeetList.length === 0 && (
+                            <div style={{ fontSize: 12, color: "var(--muted)", marginBottom: 8 }}>Belum ada gmeet buat tanggal ini.</div>
+                          )}
+                          {gmeetList.map((g) => (
+                            <div className="hl-card" key={g.id}>
+                              <div className="hl-row">
+                                <input className="hl-name" type="text" placeholder="Nama owner" value={g.name} onChange={(ev) => updateGmeet(g.id, "name", ev.target.value)} />
+                                <input className="hl-apt" type="text" placeholder="Nama apartemen" value={g.apartemen} onChange={(ev) => updateGmeet(g.id, "apartemen", ev.target.value)} />
+                                <button className="iconbtn" onClick={() => removeGmeet(g.id)} title="Hapus">✕</button>
+                              </div>
+                              <div className="hl-row">
+                                <input className="hl-remarks" type="text" placeholder="Remarks (bebas, catatan tambahan)..." value={g.remarks || ""} onChange={(ev) => updateGmeet(g.id, "remarks", ev.target.value)} />
+                              </div>
+                            </div>
+                          ))}
+                          <button className="addbtn" onClick={() => addGmeet(name)}>+ Tambah Gmeet</button>
+                        </div>
+                        <div>
+                          <div className="section-label">Follow Up</div>
+                          {e.followUps.map((f) => (
+                            <div className={`fu-row ${f.done ? "done" : ""}`} key={f.id}>
+                              <input type="checkbox" checked={f.done} onChange={(ev) => updateFollowUp(name, f.id, "done", ev.target.checked)} />
+                              <input type="text" placeholder="Follow up apa..." value={f.text} onChange={(ev) => updateFollowUp(name, f.id, "text", ev.target.value)} />
+                              <button className="iconbtn" onClick={() => removeFollowUp(name, f.id)}>✕</button>
+                            </div>
+                          ))}
+                          <button className="addbtn" onClick={() => addFollowUp(name)}>+ Tambah Follow Up</button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                );
+              })
+            )}
+          </div>
+        </>
+      )}
+
+      {view === "weekly" && (
+        <>
+          <div className="weekbar">
+            <button className="navbtn" onClick={() => setWeekStart((w) => shiftDate(w, -7))}>◂</button>
+            <div className="label">{fmtShort(weekStart)} – {fmtShort(shiftDate(weekStart, 4))}</div>
+            <button className="navbtn" onClick={() => setWeekStart((w) => shiftDate(w, 7))}>▸</button>
+          </div>
+
+          {weeklyLoading || !weekly ? (
+            <div className="empty">Menghitung ringkasan minggu ini...</div>
+          ) : (
+            <>
+              <div className="weeklist">
+                {[...amList]
+                  .map((n) => ({ name: n, r: weeklyRow(n) }))
+                  .sort((a, b) => b.r.totalSign - a.r.totalSign)
+                  .map(({ name, r }) => {
+                    const openFollow = r.followUps.filter((f) => !f.done);
+                    return (
+                      <div className="wk-row" key={name}>
+                        <div className="wk-top">
+                          <div className="wk-name">{name}</div>
+                          <div className="wk-badges">
+                            {r.calledDays === 0 ? (
+                              <span className="badge zero">📵 belum ditelepon</span>
+                            ) : (
+                              <span className="badge calls">📞 {r.calledDays}/5</span>
+                            )}
+                            <span className="badge hot">🔥 {r.newThisWeek.length} baru</span>
+                            {r.turndownThisWeek.length > 0 && <span className="badge hot">❌ {r.turndownThisWeek.length} turndown</span>}
+                            <span className="badge sign">✅ {r.totalSign} sign</span>
+                            <span className="badge ho">🔑 {r.totalHo} HO</span>
+                            {r.pendingNow.length > 0 && <span className="badge open">⏳ {r.pendingNow.length} pending</span>}
+                            {openFollow.length > 0 && <span className="badge open">📋 {openFollow.length} belum selesai</span>}
+                          </div>
+                        </div>
+                        {r.turndownThisWeek.length > 0 && (
+                          <div className="wk-detail">Turndown: {r.turndownThisWeek.map((h) => `${h.name || "-"} (${h.apartemen || "-"}) — ${h.turndownReason || "-"}${h.remarks ? ` [${h.remarks}]` : ""}`).join(" · ")}</div>
+                        )}
+                        {r.pendingNow.length > 0 && (
+                          <div className="wk-detail">Masih pending: {r.pendingNow.map((h) => `${h.name || "-"} (sejak ${fmtShort(h.addedDate)})${h.remarks ? ` — ${h.remarks}` : ""}`).join(" · ")}</div>
+                        )}
+                      </div>
+                    );
+                  })}
+              </div>
+
+              <div className="summary-box">
+                <div className="row-head">
+                  <div className="label2">📋 Ringkasan siap kirim</div>
+                  <button className={`copybtn ${copiedSummary ? "copied" : ""}`} onClick={() => handleCopy("summary")}>{copiedSummary ? "✔️" : "📋"} {copiedSummary ? "Tersalin" : "Salin teks"}</button>
+                </div>
+                <pre>{buildSummary()}</pre>
+
+                <div className="row-head">
+                  <div className="label2">📊 Tabel buat Google Sheets</div>
+                  <button className={`copybtn ${copiedTable ? "copied" : ""}`} onClick={() => handleCopy("table")}>{copiedTable ? "✔️" : "📋"} {copiedTable ? "Tersalin" : "Salin tabel"}</button>
+                </div>
+                <pre>{buildTable()}</pre>
+              </div>
+            </>
+          )}
+        </>
+      )}
+
+      {view === "briefing" && (
+        <>
+          <div className="datebar">
+            <button className="navbtn" onClick={() => setDate((d) => shiftWorkday(d, -1))}>◂</button>
+            <div className="label">{fmtLabel(date)}{isToday && <span className="today-pill">Hari ini</span>}</div>
+            <button className="navbtn" onClick={() => setDate((d) => shiftWorkday(d, 1))}>▸</button>
+          </div>
+
+          {briefingLoading || !briefingData ? (
+            <div className="empty">Memuat rangkuman...</div>
+          ) : (
+            <div className="summary-box" style={{ marginTop: 0 }}>
+              <div className="row-head">
+                <div className="label2">📋 Bahan rangkuman, siap salin</div>
+                <button className={`copybtn ${copiedBriefing ? "copied" : ""}`} onClick={copyBriefing}>{copiedBriefing ? "✔️" : "📋"} {copiedBriefing ? "Tersalin" : "Salin teks"}</button>
+              </div>
+              <pre>{buildBriefingSummary()}</pre>
+            </div>
+          )}
+        </>
+      )}
+
+      {view === "export" && (
+        <>
+          <div className="manage-note">
+            Download langsung jadi file .csv yang bisa dibuka Excel / Google Sheets. Kalau tombol download gak
+            jalan di browser lo, pakai tombol "Salin" — hasilnya tinggal paste ke sheet kosong, otomatis kebagi ke kolom-kolom.
+          </div>
+
+          <div className="summary-box" style={{ marginTop: 0 }}>
+            <div className="row-head"><div className="label2">💾 Backup Semua Data</div></div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 10 }}>
+              Simpan salinan lengkap semua data (AM, Tim, log harian, hot leads, leads in, gmeet) ke file lokal — jaga-jaga kalau ada apa-apa sama database online-nya. Lakuin sesekali, misal tiap akhir minggu.
+            </div>
+            <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+              <button className="copybtn" onClick={downloadFullBackupJSON} disabled={backingUpJson || backingUpExcel}>⬇️ {backingUpJson ? "Menyiapkan..." : "Backup JSON (lengkap)"}</button>
+              <button className="copybtn" onClick={downloadFullBackupExcel} disabled={backingUpJson || backingUpExcel}>⬇️ {backingUpExcel ? "Menyiapkan..." : "Backup Excel (semua sheet)"}</button>
+            </div>
+          </div>
+
+          <div className="summary-box">
+            <div className="row-head"><div className="label2">🔥 Semua Hot Leads ({hotLeads.length})</div></div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 10 }}>
+              Semua hot lead yang pernah diinput — pending, closing, maupun turndown — lengkap dengan remarks dan tanggal.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="copybtn" onClick={downloadHotLeadsCSV}>⬇️ Download CSV</button>
+              <button className={`copybtn ${copiedHotLeadsCSV ? "copied" : ""}`} onClick={copyHotLeadsCSV}>{copiedHotLeadsCSV ? "✔️" : "📋"} {copiedHotLeadsCSV ? "Tersalin" : "Salin"}</button>
+            </div>
+          </div>
+
+          <div className="summary-box">
+            <div className="row-head"><div className="label2">🆕 Semua Leads In ({leadsIn.length})</div></div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 10 }}>
+              Semua leads in yang pernah diinput, lengkap dengan remarks dan tanggal masuk.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="copybtn" onClick={downloadLeadsInCSV}>⬇️ Download CSV</button>
+              <button className={`copybtn ${copiedLeadsInCSV ? "copied" : ""}`} onClick={copyLeadsInCSV}>{copiedLeadsInCSV ? "✔️" : "📋"} {copiedLeadsInCSV ? "Tersalin" : "Salin"}</button>
+            </div>
+          </div>
+
+          <div className="summary-box">
+            <div className="row-head"><div className="label2">📅 Semua Gmeet ({gmeetToday.length})</div></div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 10 }}>
+              Semua jadwal gmeet yang pernah diinput per AM, lengkap dengan remarks dan tanggal.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="copybtn" onClick={downloadGmeetCSV}>⬇️ Download CSV</button>
+              <button className={`copybtn ${copiedGmeetCSV ? "copied" : ""}`} onClick={copyGmeetCSV}>{copiedGmeetCSV ? "✔️" : "📋"} {copiedGmeetCSV ? "Tersalin" : "Salin"}</button>
+            </div>
+          </div>
+
+          <div className="summary-box">
+            <div className="row-head"><div className="label2">📋 Log Harian (semua tanggal)</div></div>
+            <div style={{ fontSize: 12, color: "var(--muted)", marginTop: 6, marginBottom: 10 }}>
+              Rekap semua tanggal yang pernah lo isi: status telepon, jam, sign, dan follow up per AM per hari.
+            </div>
+            <div style={{ display: "flex", gap: 8 }}>
+              <button className="copybtn" onClick={downloadDailyLogCSV} disabled={exportingLog}>⬇️ {exportingLog ? "Menyiapkan..." : "Download CSV"}</button>
+              <button className={`copybtn ${copiedLogCSV ? "copied" : ""}`} onClick={copyDailyLogCSV} disabled={exportingLog}>{copiedLogCSV ? "✔️" : "📋"} {copiedLogCSV ? "Tersalin" : "Salin"}</button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {view === "manage" && (
+        <>
+          <div className="manage-note">
+            📌 <b>Kelola Tim</b> — bikin tim, tentuin ketua, drag nama AM antar kolom buat masukin ke tim (atau pakai dropdown kalau males drag).
+          </div>
+
+          <div className="manage-add">
+            <input type="text" placeholder="Nama tim baru..." value={newTeamName} onChange={(ev) => setNewTeamName(ev.target.value)} onKeyDown={(ev) => { if (ev.key === "Enter") handleAddTeam(); }} />
+            <input type="text" placeholder="Ketua tim (opsional)..." value={newTeamLeader} onChange={(ev) => setNewTeamLeader(ev.target.value)} onKeyDown={(ev) => { if (ev.key === "Enter") handleAddTeam(); }} />
+            <button className="manage-addbtn" onClick={handleAddTeam}>+ Tambah Tim</button>
+          </div>
+
+          <div className="kanban">
+            <div
+              className={`kanban-col ${dragOverCol === "" ? "drag-over" : ""}`}
+              onDragOver={handleDragOverCol("")}
+              onDragLeave={() => setDragOverCol(null)}
+              onDrop={handleDropCol("")}
+            >
+              <div className="kanban-col-head">
+                <div className="kanban-col-title">Belum dikelompokkan</div>
+                <div className="kanban-col-count">{unassignedList.length}</div>
+              </div>
+              <div className="kanban-col-body">
+                {unassignedList.length === 0 && <div className="kanban-empty">Semua AM udah masuk tim.</div>}
+                {unassignedList.map((name) => (
+                  <div className="am-card" key={name} draggable onDragStart={handleDragStartAm(name)} onDragEnd={handleDragEndAm}>
+                    <span className="am-card-name">{name}</span>
+                    <select value="" onChange={(ev) => ev.target.value && assignAmToTeam(name, ev.target.value)}>
+                      <option value="">Pindah ke...</option>
+                      {teams.map((t) => (<option key={t.id} value={t.id}>{t.name}</option>))}
+                    </select>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {teams.map((t) => (
+              <div
+                key={t.id}
+                className={`kanban-col ${dragOverCol === t.id ? "drag-over" : ""}`}
+                onDragOver={handleDragOverCol(t.id)}
+                onDragLeave={() => setDragOverCol(null)}
+                onDrop={handleDropCol(t.id)}
+              >
+                <div className="kanban-col-head">
+                  <input className="kanban-col-title-input" value={t.name} onChange={(ev) => handleRenameTeam(t.id, ev.target.value)} />
+                  <button className="iconbtn" onClick={() => handleRemoveTeam(t.id)} title="Hapus tim">✕</button>
+                </div>
+                <select className="kanban-leader-select" value={t.leaderName || ""} onChange={(ev) => handleSetTeamLeader(t.id, ev.target.value)}>
+                  <option value="">— Pilih ketua tim —</option>
+                  {amList.map((name) => (<option key={name} value={name}>{name}</option>))}
+                </select>
+                <div className="kanban-col-body">
+                  <div className="kanban-col-count">{t.memberNames.filter((n) => amList.includes(n)).length} anggota</div>
+                  {t.memberNames.filter((n) => amList.includes(n)).length === 0 && <div className="kanban-empty">Drag AM ke sini.</div>}
+                  {t.memberNames.filter((n) => amList.includes(n)).map((name) => (
+                    <div className="am-card" key={name} draggable onDragStart={handleDragStartAm(name)} onDragEnd={handleDragEndAm}>
+                      <span className="am-card-name">{name === t.leaderName ? `⭐ ${name}` : name}</span>
+                      <select value={t.id} onChange={(ev) => assignAmToTeam(name, ev.target.value)}>
+                        <option value="">Belum dikelompokkan</option>
+                        {teams.map((tm) => (<option key={tm.id} value={tm.id}>{tm.name}</option>))}
+                      </select>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            ))}
+          </div>
+
+          <div className="manage-note" style={{ marginTop: 20 }}>
+            Tambah atau hapus AM dari daftar aktif. Menghapus AM cuma menyembunyikannya dari daftar — data hari-hari
+            sebelumnya (termasuk hot leads yang masih pending) tetap kesimpen, cuma gak dihitung lagi di ringkasan mingguan setelah dihapus.
+          </div>
+          <div className="manage-add">
+            <input type="text" placeholder="Nama AM baru..." value={newAmName} onChange={(ev) => setNewAmName(ev.target.value)} onKeyDown={(ev) => { if (ev.key === "Enter") handleAddAM(); }} />
+            <button className="manage-addbtn" onClick={handleAddAM}>+ Tambah</button>
+          </div>
+          <div className="manage-list">
+            {amListLoading ? (
+              <div className="empty">Memuat...</div>
+            ) : amList.length === 0 ? (
+              <div className="empty">Belum ada AM di daftar.</div>
+            ) : (
+              amList.map((name) => (
+                <div className="manage-row" key={name}>
+                  <span>{name}</span>
+                  <div style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                    <select className="manage-team-select" value={teamIdOfAm(name)} onChange={(ev) => assignAmToTeam(name, ev.target.value)}>
+                      <option value="">Belum dikelompokkan</option>
+                      {teams.map((t) => (<option key={t.id} value={t.id}>{t.name}</option>))}
+                    </select>
+                    <button className="iconbtn" onClick={() => handleRemoveAM(name)}>✕</button>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        </>
+      )}
+
+      {view === "teamperf" && (
+        <>
+          <div className="tabs subtabs">
+            <button className={`tab ${teamPerfSubview === "ranking" ? "active" : ""}`} onClick={() => setTeamPerfSubview("ranking")}>🏆 Ranking</button>
+            <button className={`tab ${teamPerfSubview === "trend" ? "active" : ""}`} onClick={() => setTeamPerfSubview("trend")}>📈 Tren</button>
+          </div>
+
+          {teamPerfSubview === "ranking" && (
+          <>
+          <div className="tabs subtabs">
+            <button className={`tab ${teamPerfRange === "today" ? "active" : ""}`} onClick={() => setTeamPerfRange("today")}>Hari Ini</button>
+            <button className={`tab ${teamPerfRange === "week" ? "active" : ""}`} onClick={() => setTeamPerfRange("week")}>Minggu Ini</button>
+            <button className={`tab ${teamPerfRange === "mtd" ? "active" : ""}`} onClick={() => setTeamPerfRange("mtd")}>MTD</button>
+          </div>
+
+          {teamPerfRange === "week" && (
+            <div className="weekbar">
+              <button className="navbtn" onClick={() => setTeamPerfWeekStart((w) => shiftDate(w, -7))}>◂</button>
+              <div className="label">{fmtShort(teamPerfWeekStart)} – {fmtShort(shiftDate(teamPerfWeekStart, 4))}</div>
+              <button className="navbtn" onClick={() => setTeamPerfWeekStart((w) => shiftDate(w, 7))}>▸</button>
+            </div>
+          )}
+
+          {teamPerfLoading || !teamPerfAgg || amListLoading || teamsLoading ? (
+            <div className="empty">Menghitung performance tim...</div>
+          ) : (
+            <div className="teamlist">
+              {(() => {
+                const groups = teams.map((t) => ({
+                  id: t.id,
+                  name: t.name,
+                  leaderName: t.leaderName,
+                  members: t.memberNames.filter((n) => amList.includes(n)),
+                }));
+                const assignedSet = new Set(teams.flatMap((t) => t.memberNames));
+                const unassigned = amList.filter((n) => !assignedSet.has(n));
+                if (unassigned.length) groups.push({ id: "__unassigned", name: "Belum dikelompokkan", leaderName: "", members: unassigned });
+
+                if (groups.length === 0) return <div className="empty">Belum ada AM atau tim. Bikin dulu lewat tab "Kelola AM".</div>;
+
+                const withTotals = groups
+                  .map((g) => {
+                    const totalSign = g.members.reduce((a, n) => a + ((teamPerfAgg.byAm[n] || {}).sign || 0), 0);
+                    const totalHo = g.members.reduce((a, n) => a + ((teamPerfAgg.byAm[n] || {}).ho || 0), 0);
+                    return { ...g, totalSign, totalHo };
+                  })
+                  .sort((a, b) => b.totalSign - a.totalSign);
+
+                return withTotals.map((g) => {
+                  const isOpen = !!teamPerfExpanded[g.id];
+                  return (
+                    <div className="team-perf-row" key={g.id}>
+                      <div className="team-perf-top" onClick={() => setTeamPerfExpanded((p) => ({ ...p, [g.id]: !p[g.id] }))}>
+                        <div>
+                          <div className="team-perf-name">{g.name}</div>
+                          {g.leaderName && <div className="team-perf-leader">Ketua: {g.leaderName}</div>}
+                        </div>
+                        <div className="team-perf-badges">
+                          <span className="badge sign">✅ {g.totalSign} sign</span>
+                          <span className="badge ho">🔑 {g.totalHo} HO</span>
+                          <span className="expbtn">{isOpen ? "▾" : "▸"}</span>
+                        </div>
+                      </div>
+                      {isOpen && (
+                        <div className="team-perf-members">
+                          {g.members.length === 0 ? (
+                            <div className="empty" style={{ padding: "10px 0" }}>Belum ada AM di tim ini.</div>
+                          ) : (
+                            [...g.members]
+                              .sort((a, b) => ((teamPerfAgg.byAm[b] || {}).sign || 0) - ((teamPerfAgg.byAm[a] || {}).sign || 0))
+                              .map((n) => (
+                                <div className="team-perf-member" key={n}>
+                                  <span>{n}</span>
+                                  <span className="team-perf-member-nums">✅ {(teamPerfAgg.byAm[n] || {}).sign || 0} · 🔑 {(teamPerfAgg.byAm[n] || {}).ho || 0}</span>
+                                </div>
+                              ))
+                          )}
+                        </div>
+                      )}
+                    </div>
+                  );
+                });
+              })()}
+            </div>
+          )}
+          </>
+          )}
+
+          {teamPerfSubview === "trend" && (
+            <>
+              <div className="trend-controls">
+                <div className="tabs subtabs" style={{ marginBottom: 0 }}>
+                  <button className={`tab ${trendMetric === "sign" ? "active" : ""}`} onClick={() => setTrendMetric("sign")}>✅ Sign</button>
+                  <button className={`tab ${trendMetric === "ho" ? "active" : ""}`} onClick={() => setTrendMetric("ho")}>🔑 HO</button>
+                </div>
+                <select className="trend-range-select" value={trendDays} onChange={(ev) => setTrendDays(Number(ev.target.value))}>
+                  <option value={14}>14 hari terakhir</option>
+                  <option value={30}>30 hari terakhir</option>
+                  <option value={60}>60 hari terakhir</option>
+                  <option value={90}>90 hari terakhir</option>
+                </select>
+              </div>
+
+              {trendLoading || !trendData ? (
+                <div className="empty">Menghitung tren...</div>
+              ) : trendData.series.length === 0 ? (
+                <div className="empty">Belum ada AM atau tim. Bikin dulu lewat tab "Kelola AM".</div>
+              ) : (
+                <TeamTrendChart
+                  dates={trendData.dates}
+                  series={trendData.series}
+                  metricLabel={trendMetric === "sign" ? "Total Sign (kumulatif)" : "Total HO (kumulatif)"}
+                />
+              )}
+              <div className="manage-note" style={{ marginTop: 12 }}>
+                Grafik ini nampilin angka <b>kumulatif</b> tim (bukan tambahan harian), jadi garis naik terus itu normal — artinya progress
+                makin nambah. Komposisi tim yang dipakai adalah komposisi tim <b>saat ini</b>, bukan histori tim di tanggal-tanggal sebelumnya.
+              </div>
+            </>
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<AMCallTracker />);
+</script>
+</body>
+</html>
