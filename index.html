@@ -287,7 +287,7 @@ function AMCallTracker() {
   const [teamPerfExpanded, setTeamPerfExpanded] = useState({});
 
   const [teamPerfSubview, setTeamPerfSubview] = useState("ranking");
-  const [trendMetric, setTrendMetric] = useState("sign");
+  const [trendMetric, setTrendMetric] = useState("point");
   const [trendDays, setTrendDays] = useState(30);
   const [trendData, setTrendData] = useState(null);
   const [trendLoading, setTrendLoading] = useState(false);
@@ -830,18 +830,31 @@ function AMCallTracker() {
         // Gabung semua tanggal histori + tanggal yang mau ditampilin, urut, terus jalan maju sambil
         // "bawa" nilai terakhir yang diketahui tiap AM (forward-fill) — biar hari yang gak diisi
         // (weekend, dsb) tetap kepakai angka terakhir, bukan 0.
+        // Metrik "point" = sign + ho, jadi dua-duanya di-forward-fill terpisah lalu dijumlah.
+        const fields = trendMetric === "point" ? ["sign", "ho"] : [trendMetric];
         const combinedDates = Array.from(new Set([...relevantDates, ...dateRange])).sort();
         const lastKnown = {};
-        amList.forEach((n) => (lastKnown[n] = 0));
+        amList.forEach((n) => {
+          lastKnown[n] = {};
+          fields.forEach((f) => (lastKnown[n][f] = 0));
+        });
         const snapshotAt = {};
         combinedDates.forEach((d) => {
           const dayObj = perDate[d];
           if (dayObj) {
             amList.forEach((n) => {
-              if (dayObj[n] && dayObj[n][trendMetric] != null) lastKnown[n] = Number(dayObj[n][trendMetric]) || 0;
+              fields.forEach((f) => {
+                if (dayObj[n] && dayObj[n][f] != null) lastKnown[n][f] = Number(dayObj[n][f]) || 0;
+              });
             });
           }
-          if (dateRangeSet.has(d)) snapshotAt[d] = { ...lastKnown };
+          if (dateRangeSet.has(d)) {
+            const snap = {};
+            amList.forEach((n) => {
+              snap[n] = fields.reduce((sum, f) => sum + (lastKnown[n][f] || 0), 0);
+            });
+            snapshotAt[d] = snap;
+          }
         });
 
         const groups = teams.map((t) => ({ id: t.id, name: t.name, members: t.memberNames.filter((n) => amList.includes(n)) }));
@@ -1515,6 +1528,12 @@ function AMCallTracker() {
         .team-summary-item { border: 1px solid var(--line); background: var(--bg); border-radius: 8px; padding: 8px 10px; text-align: center; }
         .team-summary-item .n { font-size: 18px; font-weight: 700; }
         .team-summary-item .l { font-size: 10.5px; color: var(--muted); margin-top: 2px; }
+        .team-point-box { margin-top: 10px; border: 1px solid var(--brand); background: var(--brand-bg); border-radius: 12px; padding: 10px 14px; display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+        .team-point-label { font-size: 12.5px; font-weight: 700; color: var(--brand); }
+        .team-point-note { font-weight: 500; color: var(--muted); font-size: 11px; }
+        .team-point-value { font-size: 26px; font-weight: 800; color: var(--brand); line-height: 1; }
+        .badge.point { background: var(--brand-bg); color: var(--brand); font-weight: 700; }
+        .team-rank { font-size: 17px; font-weight: 800; color: var(--muted); min-width: 30px; text-align: center; flex-shrink: 0; }
 
         .kanban { display: flex; gap: 10px; overflow-x: auto; padding-bottom: 6px; margin-bottom: 8px; }
         .kanban-col { flex: 0 0 200px; border: 1px solid var(--line); background: var(--panel); border-radius: 14px; padding: 10px; display: flex; flex-direction: column; gap: 8px; transition: background 0.15s, border-color 0.15s; }
@@ -1584,6 +1603,10 @@ function AMCallTracker() {
                 <div className="team-summary-item"><div className="n display">{teamSummary.signMtd}</div><div className="l">✅ Sign MTD</div></div>
                 <div className="team-summary-item"><div className="n display">{teamSummary.hoToday}</div><div className="l">🔑 HO Hari Ini</div></div>
                 <div className="team-summary-item"><div className="n display">{teamSummary.hoMtd}</div><div className="l">🔑 HO MTD</div></div>
+              </div>
+              <div className="team-point-box">
+                <div className="team-point-label">🏆 Poin Tim <span className="team-point-note">(Sign MTD + HO MTD)</span></div>
+                <div className="team-point-value display">{teamSummary.signMtd + teamSummary.hoMtd}</div>
               </div>
             </div>
           )}
@@ -2039,22 +2062,28 @@ function AMCallTracker() {
                   .map((g) => {
                     const totalSign = g.members.reduce((a, n) => a + ((teamPerfAgg.byAm[n] || {}).sign || 0), 0);
                     const totalHo = g.members.reduce((a, n) => a + ((teamPerfAgg.byAm[n] || {}).ho || 0), 0);
-                    return { ...g, totalSign, totalHo };
+                    return { ...g, totalSign, totalHo, point: totalSign + totalHo };
                   })
-                  .sort((a, b) => b.totalSign - a.totalSign);
+                  .sort((a, b) => b.point - a.point);
 
-                return withTotals.map((g) => {
+                const medals = ["🥇", "🥈", "🥉"];
+
+                return withTotals.map((g, idx) => {
                   const isOpen = !!teamPerfExpanded[g.id];
                   return (
                     <div className="team-perf-row" key={g.id}>
                       <div className="team-perf-top" onClick={() => setTeamPerfExpanded((p) => ({ ...p, [g.id]: !p[g.id] }))}>
-                        <div>
-                          <div className="team-perf-name">{g.name}</div>
-                          {g.leaderName && <div className="team-perf-leader">Ketua: {g.leaderName}</div>}
+                        <div style={{ display: "flex", alignItems: "center", gap: 10 }}>
+                          <span className="team-rank">{g.id === "__unassigned" ? "–" : medals[idx] || `#${idx + 1}`}</span>
+                          <div>
+                            <div className="team-perf-name">{g.name}</div>
+                            {g.leaderName && <div className="team-perf-leader">Ketua: {g.leaderName}</div>}
+                          </div>
                         </div>
                         <div className="team-perf-badges">
-                          <span className="badge sign">✅ {g.totalSign} sign</span>
-                          <span className="badge ho">🔑 {g.totalHo} HO</span>
+                          <span className="badge point">🏆 {g.point} poin</span>
+                          <span className="badge sign">✅ {g.totalSign}</span>
+                          <span className="badge ho">🔑 {g.totalHo}</span>
                           <span className="expbtn">{isOpen ? "▾" : "▸"}</span>
                         </div>
                       </div>
@@ -2064,13 +2093,21 @@ function AMCallTracker() {
                             <div className="empty" style={{ padding: "10px 0" }}>Belum ada AM di tim ini.</div>
                           ) : (
                             [...g.members]
-                              .sort((a, b) => ((teamPerfAgg.byAm[b] || {}).sign || 0) - ((teamPerfAgg.byAm[a] || {}).sign || 0))
-                              .map((n) => (
-                                <div className="team-perf-member" key={n}>
-                                  <span>{n}</span>
-                                  <span className="team-perf-member-nums">✅ {(teamPerfAgg.byAm[n] || {}).sign || 0} · 🔑 {(teamPerfAgg.byAm[n] || {}).ho || 0}</span>
-                                </div>
-                              ))
+                              .sort((a, b) => {
+                                const pa = ((teamPerfAgg.byAm[a] || {}).sign || 0) + ((teamPerfAgg.byAm[a] || {}).ho || 0);
+                                const pb = ((teamPerfAgg.byAm[b] || {}).sign || 0) + ((teamPerfAgg.byAm[b] || {}).ho || 0);
+                                return pb - pa;
+                              })
+                              .map((n) => {
+                                const s = (teamPerfAgg.byAm[n] || {}).sign || 0;
+                                const h = (teamPerfAgg.byAm[n] || {}).ho || 0;
+                                return (
+                                  <div className="team-perf-member" key={n}>
+                                    <span>{n}</span>
+                                    <span className="team-perf-member-nums">🏆 {s + h} · ✅ {s} · 🔑 {h}</span>
+                                  </div>
+                                );
+                              })
                           )}
                         </div>
                       )}
@@ -2087,6 +2124,7 @@ function AMCallTracker() {
             <>
               <div className="trend-controls">
                 <div className="tabs subtabs" style={{ marginBottom: 0 }}>
+                  <button className={`tab ${trendMetric === "point" ? "active" : ""}`} onClick={() => setTrendMetric("point")}>🏆 Poin</button>
                   <button className={`tab ${trendMetric === "sign" ? "active" : ""}`} onClick={() => setTrendMetric("sign")}>✅ Sign</button>
                   <button className={`tab ${trendMetric === "ho" ? "active" : ""}`} onClick={() => setTrendMetric("ho")}>🔑 HO</button>
                 </div>
@@ -2106,7 +2144,7 @@ function AMCallTracker() {
                 <TeamTrendChart
                   dates={trendData.dates}
                   series={trendData.series}
-                  metricLabel={trendMetric === "sign" ? "Total Sign (kumulatif)" : "Total HO (kumulatif)"}
+                  metricLabel={trendMetric === "point" ? "Poin Tim (Sign + HO)" : trendMetric === "sign" ? "Total Sign (kumulatif)" : "Total HO (kumulatif)"}
                 />
               )}
               <div className="manage-note" style={{ marginTop: 12 }}>
