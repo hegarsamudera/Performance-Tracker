@@ -179,36 +179,38 @@ function emptyDay(list) {
 // Cari nilai "sign" (kumulatif) terakhir yang tercatat untuk tiap nama AM,
 // pada atau sebelum tanggal tertentu. Dipakai buat auto-carry sign pas ganti hari,
 // dan buat menghitung "sign hari ini" / "sign minggu ini" (selisih dari baseline).
+// Cari nilai field (sign/ho) terakhir yang diketahui, per AM, pada atau sebelum tanggal tertentu.
+// Skema penyimpanan: satu dokumen per AM per hari (day:{amName}:{date}), jadi tiap AM independen —
+// nggak ada dua orang yang bakal nulis ke dokumen yang sama, meskipun isi bersamaan persis di detik yang sama.
 async function getFieldSnapshot(names, atOrBeforeDate, field) {
-  const remaining = new Set(names);
   const map = {};
-  try {
-    const listRes = await window.storage.list("day:");
-    const keys = (listRes && listRes.keys) || [];
-    const dates = keys
-      .map((k) => k.slice(4))
-      .filter((d) => d <= atOrBeforeDate)
-      .sort()
-      .reverse();
-    for (const d of dates) {
-      if (remaining.size === 0) break;
+  await Promise.all(
+    names.map(async (n) => {
       try {
-        const res = await window.storage.get(`day:${d}`);
+        const prefix = `day:${n}:`;
+        const listRes = await window.storage.list(prefix);
+        const keys = (listRes && listRes.keys) || [];
+        const dates = keys
+          .map((k) => k.slice(prefix.length))
+          .filter((d) => d <= atOrBeforeDate)
+          .sort();
+        if (dates.length === 0) {
+          map[n] = 0;
+          return;
+        }
+        const lastDate = dates[dates.length - 1];
+        const res = await window.storage.get(`${prefix}${lastDate}`);
         if (res && res.value) {
           const parsed = JSON.parse(res.value);
-          remaining.forEach((n) => {
-            if (parsed[n] && parsed[n][field] != null) map[n] = Number(parsed[n][field]) || 0;
-          });
-          [...remaining].forEach((n) => {
-            if (map[n] != null) remaining.delete(n);
-          });
+          map[n] = Number(parsed[field]) || 0;
+        } else {
+          map[n] = 0;
         }
-      } catch (e) {}
-    }
-  } catch (e) {}
-  names.forEach((n) => {
-    if (map[n] == null) map[n] = 0;
-  });
+      } catch (e) {
+        map[n] = 0;
+      }
+    })
+  );
   return map;
 }
 function getSignSnapshot(names, atOrBeforeDate) {
@@ -264,6 +266,7 @@ function AMCallTracker() {
   const [amList, setAmList] = useState([]);
   const [amListLoading, setAmListLoading] = useState(true);
   const [newAmName, setNewAmName] = useState("");
+  const [migrationDone, setMigrationDone] = useState(false);
 
   const [teams, setTeams] = useState([]);
   const [teamsLoading, setTeamsLoading] = useState(true);
@@ -331,6 +334,7 @@ function AMCallTracker() {
 
   const saveTimer = useRef(null);
   const skipSave = useRef(true);
+  const dirtyAmRef = useRef(new Set());
   const hlSaveTimer = useRef(null);
   const skipHlSave = useRef(true);
   const liSaveTimer = useRef(null);
@@ -338,6 +342,51 @@ function AMCallTracker() {
   const gmSaveTimer = useRef(null);
   const skipGmSave = useRef(true);
   const leadsFileInputRef = useRef(null);
+
+  // Migrasi satu kali: data lama disimpen sebagai 1 dokumen per HARI (isinya semua AM sekaligus).
+  // Sekarang dipecah jadi 1 dokumen per AM per HARI, biar tiap AM nulis ke tempatnya sendiri-sendiri
+  // dan gak akan pernah tabrakan walau diisi bersamaan. Migrasi ini aman dijalankan berkali-kali
+  // (idempotent) dan ditandai selesai lewat key "migrated:v2" biar gak diulang terus tiap buka app.
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        let already = false;
+        try {
+          const res = await window.storage.get("migrated:v2");
+          already = !!(res && res.value === "true");
+        } catch (e) {
+          already = false;
+        }
+        if (!already) {
+          const listRes = await window.storage.list("day:");
+          const keys = (listRes && listRes.keys) || [];
+          const oldKeys = keys.filter((k) => /^day:\d{4}-\d{2}-\d{2}$/.test(k));
+          for (const k of oldKeys) {
+            try {
+              const res = await window.storage.get(k);
+              if (res && res.value) {
+                const dateStr = k.slice(4);
+                const parsed = JSON.parse(res.value);
+                const names = Object.keys(parsed);
+                await Promise.all(names.map((n) => window.storage.set(`day:${n}:${dateStr}`, JSON.stringify(parsed[n]))));
+              }
+            } catch (e) {
+              console.error("migrasi gagal untuk", k, e);
+            }
+          }
+          try {
+            await window.storage.set("migrated:v2", "true");
+          } catch (e) {}
+        }
+      } catch (e) {
+        console.error("migrasi error", e);
+      } finally {
+        if (!cancelled) setMigrationDone(true);
+      }
+    })();
+    return () => { cancelled = true; };
+  }, []);
 
   useEffect(() => {
     let cancelled = false;
@@ -604,10 +653,11 @@ function AMCallTracker() {
   }, []);
 
   useEffect(() => {
-    if (amListLoading) return;
+    if (amListLoading || !migrationDone) return;
     let cancelled = false;
     setLoading(true);
     skipSave.current = true;
+    dirtyAmRef.current = new Set();
     (async () => {
       try {
         const baseline = await getSignSnapshot(amList, shiftDate(date, -1));
@@ -616,34 +666,35 @@ function AMCallTracker() {
         setSignBaseline(baseline);
         setHoBaseline(hoBase);
 
-        const res = await window.storage.get(`day:${date}`);
-        if (cancelled) return;
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          const merged = emptyDay(amList);
-          amList.forEach((n) => {
-            if (parsed[n]) {
-              merged[n] = {
-                ...emptyEntry(),
-                called: !!parsed[n].called,
-                sign: parsed[n].sign || 0,
-                ho: parsed[n].ho || 0,
-                followUps: Array.isArray(parsed[n].followUps) ? parsed[n].followUps : [],
-              };
-            } else {
-              // AM belum ada catatan di hari ini — mulai dari sign & HO hari sebelumnya, bukan 0
-              merged[n] = { ...emptyEntry(), sign: baseline[n] || 0, ho: hoBase[n] || 0 };
+        // Tiap AM punya dokumen sendiri (day:{amName}:{date}), diambil paralel — biar cepet
+        // dan biar data satu AM gak nunggu/ketuker data AM lain.
+        const results = await Promise.all(
+          amList.map(async (n) => {
+            try {
+              const res = await window.storage.get(`day:${n}:${date}`);
+              return [n, res && res.value ? JSON.parse(res.value) : null];
+            } catch (e) {
+              return [n, null];
             }
-          });
-          setData(merged);
-        } else {
-          // Hari baru, belum pernah diisi sama sekali — semua AM mulai dari sign & HO terakhir mereka
-          const fresh = emptyDay(amList);
-          amList.forEach((n) => {
-            fresh[n] = { ...fresh[n], sign: baseline[n] || 0, ho: hoBase[n] || 0 };
-          });
-          setData(fresh);
-        }
+          })
+        );
+        if (cancelled) return;
+        const merged = emptyDay(amList);
+        results.forEach(([n, parsed]) => {
+          if (parsed) {
+            merged[n] = {
+              ...emptyEntry(),
+              called: !!parsed.called,
+              sign: parsed.sign || 0,
+              ho: parsed.ho || 0,
+              followUps: Array.isArray(parsed.followUps) ? parsed.followUps : [],
+            };
+          } else {
+            // AM belum ada catatan di hari ini — mulai dari sign & HO hari sebelumnya, bukan 0
+            merged[n] = { ...emptyEntry(), sign: baseline[n] || 0, ho: hoBase[n] || 0 };
+          }
+        });
+        setData(merged);
       } catch (e) {
         if (!cancelled) setData(emptyDay(amList));
       } finally {
@@ -651,7 +702,29 @@ function AMCallTracker() {
       }
     })();
     return () => { cancelled = true; };
-  }, [date, amList, amListLoading]);
+  }, [date, amList, amListLoading, migrationDone]);
+
+  // Nyimpen data harian: tiap AM yang beneran diedit di browser ini ditulis LANGSUNG ke
+  // dokumennya sendiri (day:{amName}:{date}) secara paralel. Gak perlu transaction/merge lagi,
+  // karena tiap AM sekarang punya dokumen masing-masing — struktur datanya sendiri yang mencegah
+  // tabrakan, jadi biarpun 20+ orang isi bersamaan di detik yang sama, gak akan saling nimpa.
+  const saveDirtyEntries = async (forDate) => {
+    const dirtyNames = Array.from(dirtyAmRef.current);
+    if (dirtyNames.length === 0) return;
+    const toSave = dirtyNames.filter((n) => data[n]);
+    const results = await Promise.allSettled(
+      toSave.map((n) => window.storage.set(`day:${n}:${forDate}`, JSON.stringify(data[n])))
+    );
+    results.forEach((r, i) => {
+      const n = toSave[i];
+      if (r.status === "fulfilled") {
+        dirtyAmRef.current.delete(n);
+      } else {
+        console.error("gagal menyimpan", n, r.reason);
+        // biarin tetep dirty biar dicoba lagi di siklus save berikutnya
+      }
+    });
+  };
 
   useEffect(() => {
     if (loading) return;
@@ -660,18 +733,15 @@ function AMCallTracker() {
       return;
     }
     if (saveTimer.current) clearTimeout(saveTimer.current);
-    saveTimer.current = setTimeout(async () => {
-      try {
-        await window.storage.set(`day:${date}`, JSON.stringify(data));
-      } catch (e) {
-        console.error("gagal menyimpan", e);
-      }
+    const forDate = date;
+    saveTimer.current = setTimeout(() => {
+      saveDirtyEntries(forDate);
     }, 500);
     return () => clearTimeout(saveTimer.current);
   }, [data, date, loading]);
 
   useEffect(() => {
-    if (view !== "weekly" || amListLoading || hotLeadsLoading) return;
+    if (view !== "weekly" || amListLoading || hotLeadsLoading || !migrationDone) return;
     let cancelled = false;
     setWeeklyLoading(true);
     (async () => {
@@ -679,20 +749,20 @@ function AMCallTracker() {
       const agg = {};
       amList.forEach((n) => (agg[n] = { signs: 0, ho: 0, calledDays: 0, followUps: [] }));
       for (const iso of range) {
-        try {
-          const res = await window.storage.get(`day:${iso}`);
-          if (res && res.value) {
-            const parsed = JSON.parse(res.value);
-            amList.forEach((n) => {
-              const e = parsed[n];
-              if (!e) return;
-              if (e.called) agg[n].calledDays += 1;
-              (Array.isArray(e.followUps) ? e.followUps : []).forEach((f) => agg[n].followUps.push({ ...f, date: iso }));
-            });
-          }
-        } catch (e) {
-          // gak ada data di tanggal itu — lewati
-        }
+        await Promise.all(
+          amList.map(async (n) => {
+            try {
+              const res = await window.storage.get(`day:${n}:${iso}`);
+              if (res && res.value) {
+                const e = JSON.parse(res.value);
+                if (e.called) agg[n].calledDays += 1;
+                (Array.isArray(e.followUps) ? e.followUps : []).forEach((f) => agg[n].followUps.push({ ...f, date: iso }));
+              }
+            } catch (err) {
+              // gak ada data AM ini di tanggal itu — lewati
+            }
+          })
+        );
       }
       // "sign"/"ho" itu angka kumulatif (kebawa tiap hari), jadi angka minggu ini = nilai akhir - nilai sebelum minggu mulai
       if (!cancelled) {
@@ -713,34 +783,38 @@ function AMCallTracker() {
       }
     })();
     return () => { cancelled = true; };
-  }, [view, weekStart, amList, amListLoading, hotLeadsLoading]);
+  }, [view, weekStart, amList, amListLoading, hotLeadsLoading, migrationDone]);
 
   useEffect(() => {
-    if (view !== "briefing" || amListLoading) return;
+    if (view !== "briefing" || amListLoading || !migrationDone) return;
     let cancelled = false;
     setBriefingLoading(true);
     (async () => {
       try {
-        const res = await window.storage.get(`day:${date}`);
-        if (cancelled) return;
-        if (res && res.value) {
-          const parsed = JSON.parse(res.value);
-          const merged = emptyDay(amList);
-          amList.forEach((n) => {
-            if (parsed[n]) {
-              merged[n] = {
-                ...emptyEntry(),
-                called: !!parsed[n].called,
-                sign: parsed[n].sign || 0,
-                ho: parsed[n].ho || 0,
-                followUps: Array.isArray(parsed[n].followUps) ? parsed[n].followUps : [],
-              };
+        const results = await Promise.all(
+          amList.map(async (n) => {
+            try {
+              const res = await window.storage.get(`day:${n}:${date}`);
+              return [n, res && res.value ? JSON.parse(res.value) : null];
+            } catch (e) {
+              return [n, null];
             }
-          });
-          setBriefingData(merged);
-        } else {
-          setBriefingData(emptyDay(amList));
-        }
+          })
+        );
+        if (cancelled) return;
+        const merged = emptyDay(amList);
+        results.forEach(([n, parsed]) => {
+          if (parsed) {
+            merged[n] = {
+              ...emptyEntry(),
+              called: !!parsed.called,
+              sign: parsed.sign || 0,
+              ho: parsed.ho || 0,
+              followUps: Array.isArray(parsed.followUps) ? parsed.followUps : [],
+            };
+          }
+        });
+        setBriefingData(merged);
       } catch (e) {
         if (!cancelled) setBriefingData(emptyDay(amList));
       } finally {
@@ -748,10 +822,10 @@ function AMCallTracker() {
       }
     })();
     return () => { cancelled = true; };
-  }, [view, date, amList, amListLoading]);
+  }, [view, date, amList, amListLoading, migrationDone]);
 
   useEffect(() => {
-    if (view !== "teamperf" || amListLoading) return;
+    if (view !== "teamperf" || amListLoading || !migrationDone) return;
     let cancelled = false;
     setTeamPerfLoading(true);
     (async () => {
@@ -802,10 +876,10 @@ function AMCallTracker() {
       }
     })();
     return () => { cancelled = true; };
-  }, [view, teamPerfRange, teamPerfWeekStart, amList, amListLoading]);
+  }, [view, teamPerfRange, teamPerfWeekStart, amList, amListLoading, migrationDone]);
 
   useEffect(() => {
-    if (view !== "teamperf" || teamPerfSubview !== "trend" || amListLoading || teamsLoading) return;
+    if (view !== "teamperf" || teamPerfSubview !== "trend" || amListLoading || teamsLoading || !migrationDone) return;
     let cancelled = false;
     setTrendLoading(true);
     (async () => {
@@ -814,48 +888,55 @@ function AMCallTracker() {
         const startDate = shiftDate(endDate, -(trendDays - 1));
         const dateRange = Array.from({ length: trendDays }, (_, i) => shiftDate(startDate, i));
         const dateRangeSet = new Set(dateRange);
-
-        const listRes = await window.storage.list("day:");
-        const keys = (listRes && listRes.keys) || [];
-        const relevantDates = keys.map((k) => k.slice(4)).filter((d) => d <= endDate).sort();
-
-        const perDate = {};
-        for (const d of relevantDates) {
-          try {
-            const res = await window.storage.get(`day:${d}`);
-            if (res && res.value) perDate[d] = JSON.parse(res.value);
-          } catch (e) {}
-        }
-
-        // Gabung semua tanggal histori + tanggal yang mau ditampilin, urut, terus jalan maju sambil
-        // "bawa" nilai terakhir yang diketahui tiap AM (forward-fill) — biar hari yang gak diisi
-        // (weekend, dsb) tetap kepakai angka terakhir, bukan 0.
         // Metrik "point" = sign + ho, jadi dua-duanya di-forward-fill terpisah lalu dijumlah.
         const fields = trendMetric === "point" ? ["sign", "ho"] : [trendMetric];
-        const combinedDates = Array.from(new Set([...relevantDates, ...dateRange])).sort();
-        const lastKnown = {};
-        amList.forEach((n) => {
-          lastKnown[n] = {};
-          fields.forEach((f) => (lastKnown[n][f] = 0));
-        });
-        const snapshotAt = {};
-        combinedDates.forEach((d) => {
-          const dayObj = perDate[d];
-          if (dayObj) {
-            amList.forEach((n) => {
-              fields.forEach((f) => {
-                if (dayObj[n] && dayObj[n][f] != null) lastKnown[n][f] = Number(dayObj[n][f]) || 0;
+
+        // Tiap AM punya dokumennya sendiri per hari, jadi histori diambil per-AM (paralel),
+        // bukan nge-list semua "day:" sekaligus kayak dulu — lebih ringan & gak kena batasan
+        // satu dokumen gede yang isinya semua orang.
+        const snapshotAt = {}; // date -> { amName: nilai gabungan (sign+ho atau salah satunya) }
+        dateRange.forEach((d) => (snapshotAt[d] = {}));
+
+        await Promise.all(
+          amList.map(async (n) => {
+            try {
+              const prefix = `day:${n}:`;
+              const listRes = await window.storage.list(prefix);
+              const keys = (listRes && listRes.keys) || [];
+              const relevantDates = keys.map((k) => k.slice(prefix.length)).filter((d) => d <= endDate).sort();
+
+              const docs = {};
+              await Promise.all(
+                relevantDates.map(async (d) => {
+                  try {
+                    const res = await window.storage.get(`${prefix}${d}`);
+                    if (res && res.value) docs[d] = JSON.parse(res.value);
+                  } catch (e) {}
+                })
+              );
+
+              // Gabung tanggal histori AM ini + tanggal yang mau ditampilin, urut, jalan maju
+              // sambil "bawa" nilai terakhir yang diketahui (forward-fill) — biar hari yang gak
+              // diisi (weekend, dsb) tetap kepakai angka terakhir, bukan 0.
+              const combinedDates = Array.from(new Set([...relevantDates, ...dateRange])).sort();
+              const lastKnown = {};
+              fields.forEach((f) => (lastKnown[f] = 0));
+              combinedDates.forEach((d) => {
+                const dayObj = docs[d];
+                if (dayObj) {
+                  fields.forEach((f) => {
+                    if (dayObj[f] != null) lastKnown[f] = Number(dayObj[f]) || 0;
+                  });
+                }
+                if (dateRangeSet.has(d)) {
+                  snapshotAt[d][n] = fields.reduce((sum, f) => sum + (lastKnown[f] || 0), 0);
+                }
               });
-            });
-          }
-          if (dateRangeSet.has(d)) {
-            const snap = {};
-            amList.forEach((n) => {
-              snap[n] = fields.reduce((sum, f) => sum + (lastKnown[n][f] || 0), 0);
-            });
-            snapshotAt[d] = snap;
-          }
-        });
+            } catch (e) {
+              // AM ini gagal diambil historinya — biarin nilainya 0 di semua tanggal
+            }
+          })
+        );
 
         const groups = teams.map((t) => ({ id: t.id, name: t.name, members: t.memberNames.filter((n) => amList.includes(n)) }));
         const assignedSet = new Set(teams.flatMap((t) => t.memberNames));
@@ -878,12 +959,15 @@ function AMCallTracker() {
       }
     })();
     return () => { cancelled = true; };
-  }, [view, teamPerfSubview, trendMetric, trendDays, amList, amListLoading, teams, teamsLoading]);
+  }, [view, teamPerfSubview, trendMetric, trendDays, amList, amListLoading, teams, teamsLoading, migrationDone]);
 
-  const setEntry = (name, patch) =>
+  const setEntry = (name, patch) => {
+    dirtyAmRef.current.add(name);
     setData((prev) => ({ ...prev, [name]: { ...(prev[name] || emptyEntry()), ...patch } }));
+  };
 
   const toggleCalled = (name) => {
+    dirtyAmRef.current.add(name);
     setData((prev) => {
       const cur = prev[name] || emptyEntry();
       const wasCalled = cur.called;
@@ -891,18 +975,24 @@ function AMCallTracker() {
     });
   };
 
-  const addFollowUp = (name) =>
+  const addFollowUp = (name) => {
+    dirtyAmRef.current.add(name);
     setData((prev) => ({
       ...prev,
       [name]: { ...prev[name], followUps: [...prev[name].followUps, { id: newId(), text: "", done: false }] },
     }));
-  const updateFollowUp = (name, id, field, value) =>
+  };
+  const updateFollowUp = (name, id, field, value) => {
+    dirtyAmRef.current.add(name);
     setData((prev) => ({
       ...prev,
       [name]: { ...prev[name], followUps: prev[name].followUps.map((f) => (f.id === id ? { ...f, [field]: value } : f)) },
     }));
-  const removeFollowUp = (name, id) =>
+  };
+  const removeFollowUp = (name, id) => {
+    dirtyAmRef.current.add(name);
     setData((prev) => ({ ...prev, [name]: { ...prev[name], followUps: prev[name].followUps.filter((f) => f.id !== id) } }));
+  };
 
   const addHotLead = (amName) => {
     setHotLeads((prev) => [
@@ -1284,24 +1374,32 @@ function AMCallTracker() {
 
   const fetchDailyLogRows = async () => {
     const header = ["Tanggal", "AM", "Tim", "Sudah Isi Data", "Sign (Hari Ini)", "Sign (Kumulatif)", "HO (Hari Ini)", "HO (Kumulatif)", "Follow Up"];
-    const listRes = await window.storage.list("day:");
-    const keys = (listRes && listRes.keys) || [];
     const byName = {};
-    for (const key of keys) {
-      try {
-        const res = await window.storage.get(key);
-        if (!res || !res.value) continue;
-        const dateStr = key.replace(/^day:/, "");
-        const parsed = JSON.parse(res.value);
-        amList.forEach((name) => {
-          const e = parsed[name];
-          if (!e) return;
-          const followUpsText = (Array.isArray(e.followUps) ? e.followUps : []).map((f) => `${f.done ? "[selesai]" : "[belum]"} ${f.text}`).join(" | ") || "-";
-          if (!byName[name]) byName[name] = [];
-          byName[name].push({ dateStr, called: e.called, signCum: Number(e.sign) || 0, hoCum: Number(e.ho) || 0, followUpsText });
-        });
-      } catch (e) {}
-    }
+    await Promise.all(
+      amList.map(async (name) => {
+        try {
+          const prefix = `day:${name}:`;
+          const listRes = await window.storage.list(prefix);
+          const keys = (listRes && listRes.keys) || [];
+          const dates = keys.map((k) => k.slice(prefix.length)).sort();
+          const rows = [];
+          await Promise.all(
+            dates.map(async (dateStr) => {
+              try {
+                const res = await window.storage.get(`${prefix}${dateStr}`);
+                if (!res || !res.value) return;
+                const e = JSON.parse(res.value);
+                const followUpsText = (Array.isArray(e.followUps) ? e.followUps : []).map((f) => `${f.done ? "[selesai]" : "[belum]"} ${f.text}`).join(" | ") || "-";
+                rows.push({ dateStr, called: e.called, signCum: Number(e.sign) || 0, hoCum: Number(e.ho) || 0, followUpsText });
+              } catch (e) {}
+            })
+          );
+          byName[name] = rows;
+        } catch (e) {
+          byName[name] = [];
+        }
+      })
+    );
     const teamNameOf = (name) => {
       const t = teams.find((t) => t.memberNames.includes(name));
       return t ? t.name : "Belum dikelompokkan";
