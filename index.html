@@ -10,6 +10,7 @@
 <script src="https://unpkg.com/xlsx@0.18.5/dist/xlsx.full.min.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-app-compat.js"></script>
 <script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-firestore-compat.js"></script>
+<script src="https://www.gstatic.com/firebasejs/10.13.2/firebase-auth-compat.js"></script>
 <script src="https://unpkg.com/chart.js@4.4.4/dist/chart.umd.js"></script>
 <style>
   html, body { margin: 0; padding: 0; background: #EEF1EE; }
@@ -34,7 +35,16 @@ const firebaseConfig = {
 };
 firebase.initializeApp(firebaseConfig);
 const db = firebase.firestore();
+const auth = firebase.auth();
 const KV = db.collection("kv");
+
+// Passcode bersama buat semua AM/ketua kelompok — dibagiin manual (chat/WA grup, dll), bukan per-orang.
+// GANTI INI kapan aja lo mau kode akses baru; gak perlu update apapun di Firebase/Firestore.
+// Catatan jujur: ini cuma jadi "portal masuk" biar orang random yang nemu link doang gak bisa masuk.
+// Karena ini kode di file HTML, orang yang niat banget bisa lihat kode ini lewat "view source" —
+// proteksi sungguhannya ada di Firestore Rules (butuh login, bukan cuma tau passcode-nya doang) dan
+// pembatasan domain di Google Cloud Console.
+const APP_PASSCODE = "travelio2026";
 
 // Firestore doc ID gak boleh mengandung "/", key kita (mis. "day:2026-09-15") aman karena
 // cuma pakai ":" dan "-". Kalau suatu saat ada key aneh yang mengandung "/", di-encode dulu.
@@ -2257,7 +2267,83 @@ function AMCallTracker() {
   );
 }
 
-ReactDOM.createRoot(document.getElementById("root")).render(<AMCallTracker />);
+function AuthGate() {
+  const [checking, setChecking] = React.useState(true);
+  const [authed, setAuthed] = React.useState(false);
+  const [code, setCode] = React.useState("");
+  const [error, setError] = React.useState("");
+  const [submitting, setSubmitting] = React.useState(false);
+
+  React.useEffect(() => {
+    const unsub = auth.onAuthStateChanged((user) => {
+      setAuthed(!!user);
+      setChecking(false);
+    });
+    return () => unsub();
+  }, []);
+
+  const handleSubmit = async (ev) => {
+    ev.preventDefault();
+    setError("");
+    if (code.trim() !== APP_PASSCODE) {
+      setError("Kode akses salah. Coba lagi atau tanya ke atasan/tim lo.");
+      return;
+    }
+    setSubmitting(true);
+    try {
+      await auth.signInAnonymously();
+      // onAuthStateChanged di atas bakal otomatis nge-update authed jadi true
+    } catch (e) {
+      setError("Gagal masuk: " + e.message);
+      setSubmitting(false);
+    }
+  };
+
+  if (checking) {
+    return (
+      <div className="gatewrap">
+        <div className="gate-loading">Memuat...</div>
+      </div>
+    );
+  }
+
+  if (authed) return <AMCallTracker />;
+
+  return (
+    <div className="gatewrap">
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Poppins:wght@400;500;600;700;800&display=swap');
+        .gatewrap { min-height: 100vh; display: flex; align-items: center; justify-content: center; background: #FBF6F0; font-family: 'Poppins', ui-sans-serif, sans-serif; padding: 20px; box-sizing: border-box; }
+        .gate-loading { color: #8A7F74; font-size: 13px; }
+        .gate-card { background: #FFFFFF; border: 1px solid #ECE2D6; border-radius: 18px; padding: 28px 26px; width: 100%; max-width: 340px; box-shadow: 0 4px 24px rgba(0,0,0,0.05); text-align: center; }
+        .gate-card input { box-sizing: border-box; }
+        .gate-title { font-size: 16px; font-weight: 800; color: #23262B; margin-top: 10px; margin-bottom: 4px; }
+        .gate-sub { font-size: 12px; color: #8A7F74; margin-bottom: 18px; }
+        .gate-input { width: 100%; border: 1px solid #ECE2D6; border-radius: 10px; padding: 11px 14px; font-size: 15px; font-family: inherit; text-align: center; letter-spacing: 0.05em; margin-bottom: 10px; background: #FBF6F0; color: #23262B; }
+        .gate-input:focus { outline: none; border-color: #E4463A; }
+        .gate-btn { width: 100%; border: none; background: #E4463A; color: #fff; font-size: 14px; font-weight: 700; padding: 11px; border-radius: 999px; cursor: pointer; font-family: inherit; }
+        .gate-btn:disabled { opacity: 0.6; cursor: default; }
+        .gate-error { color: #C93A2F; font-size: 12px; margin-bottom: 10px; }
+      `}</style>
+      <form className="gate-card" onSubmit={handleSubmit}>
+        <div className="gate-title">🔒 AM Performance Tracker</div>
+        <div className="gate-sub">Masukin kode akses buat lanjut</div>
+        {error && <div className="gate-error">{error}</div>}
+        <input
+          className="gate-input"
+          type="password"
+          placeholder="Kode akses"
+          value={code}
+          onChange={(ev) => setCode(ev.target.value)}
+          autoFocus
+        />
+        <button className="gate-btn" type="submit" disabled={submitting}>{submitting ? "Memeriksa..." : "Masuk"}</button>
+      </form>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<AuthGate />);
 </script>
 </body>
 </html>
